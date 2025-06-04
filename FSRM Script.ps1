@@ -1,8 +1,8 @@
 function Install-FSRMRansomware {
     <#
     .SYNOPSIS
-    Installs the File Server Resource Manager role if not installed and then configured a file screen on all drives other than C. 
-    The file screen screens for possible ransomware infections and then deny's SMB access to the user who trigged the screen.
+    Installs the File Server Resource Manager role if not installed and then configures a file screen on all drives other than C.
+    The file screen screens for possible ransomware infections and then denies SMB access to the user who triggered the screen.
     .PARAMETER SMTPServer
     Specify the address of an email relay server. This is used to send the alert emails that generate when the file screen is triggered.
     .PARAMETER EmailTO
@@ -63,7 +63,7 @@ function Install-FSRMRansomware {
                             "*.micro",
                             "*.encrypted",
                             "*.locked",
-                            "*.crypto"
+                            "*.crypto",
                             "*_crypt",
                             "*.crinf", 
                             "*.r5a", 
