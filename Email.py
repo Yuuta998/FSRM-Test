@@ -1,7 +1,7 @@
 import smtplib
 import socket
 
-sender_address = "" # Replace this with sendor email address
+sender_address = "" # Replace this with sender email address
  
 receiver_address = "" # Replace this with any valid email address (this is the receiver address)
  
