@@ -4466,8 +4466,15 @@ function Install-FSRMRansomware {
                                         `$username = (`$RansomwareEvents.message).split()[1]
                                         `$username = `$username -replace ".*\\"
 
-                                        #Blocks SMB share access for user
-                                        Get-SmbShare | Where-Object currentusers -gt 0 | Block-SmbShareAccess -AccountName `$username -force
+                                        # Blocks SMB share access for user. The
+                                        # original line attempted to use
+                                        # `Where-Object` without specifying the
+                                        # property parameter, which caused an
+                                        # error. Use the property comparison
+                                        # form instead.
+                                        Get-SmbShare |
+                                            Where-Object -Property CurrentUsers -GT 0 |
+                                            Block-SmbShareAccess -AccountName `$username -Force
                                         
                          
 "@
