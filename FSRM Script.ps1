@@ -63,7 +63,7 @@ function Install-FSRMRansomware {
                             "*.micro",
                             "*.encrypted",
                             "*.locked",
-                            "*.crypto"
+                            "*.crypto",
                             "*_crypt",
                             "*.crinf", 
                             "*.r5a", 
