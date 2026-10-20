@@ -4506,11 +4506,13 @@ function Install-FSRMRansomware {
                          
 "@
 
-            #Creates file path to store block smb script that is called by the FSRM template
-            New-Item -Path "C:\scripts" -Force -Type directory
-            $DenyPermissionsScript | Out-File -FilePath "C:\scripts\ScriptToDenyPermissions.PS1"
+            # FSRM runs this script elevated. The directory must not inherit write
+            # access from C:\, and an existing user-owned folder is refused.
+            Initialize-ProtectedScriptsDirectory
+            $DenyPermissionsScript | Out-File -FilePath "C:\scripts\ScriptToDenyPermissions.PS1" -ErrorAction Stop
             #unwblocks the script to allo for execution 
             Unblock-file "C:\scripts\ScriptToDenyPermissions.PS1"
+            Set-ProtectedFileAcl -Path "C:\scripts\ScriptToDenyPermissions.PS1"
 
             #find all drives that are not the C drive and create file screen for those drives. Essentially all drives except the C drive will be monitored for crypto locker files.
             $disks = GET-WMIOBJECT win32_logicaldisk -filter "DriveType='3'" | Where-Object {$_.deviceid -ne "C:"}
@@ -4528,14 +4530,6 @@ function Install-FSRMRansomware {
 }
 # SMTPServer, EmailTo, and EmailFrom are required parameters.
 # Supply them when running this script. Example addresses are not embedded here.
-Install-FSRMRansomware -SMTPServer $SMTPServer -EmailTo $EmailTo -EmailFrom $EmailFrom
-
-# Install supported Python 3.12 for Email.py.
-# Python 3.12.10 is the latest 3.12.x release published as a Windows installer on
-# python.org. Later 3.12 releases are source-only security updates.
-# Prefer winget when it is available. Otherwise download the official installer
-# into a new private directory and abort unless Get-FileHash matches the SHA256
-# published for that python.org file.
 
 function Assert-PythonInstallerSha256 {
     param(
@@ -4585,6 +4579,77 @@ function Assert-ExistingDownloadDirectory {
     throw "Refusing the Python download directory because it already exists."
 }
 
+function Get-ScriptsDirectoryAction {
+    param(
+        [Parameter(Mandatory = $true)]
+        [bool]$Exists,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$IsReparsePoint,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$IsDirectory,
+
+        [string]$OwnerSid
+    )
+
+    if (-not $Exists) {
+        return 'Create'
+    }
+
+    if ($IsReparsePoint) {
+        throw "Refusing C:\scripts because it is a reparse point (junction or symlink)."
+    }
+
+    if (-not $IsDirectory) {
+        throw "Refusing C:\scripts because it is not a directory."
+    }
+
+    if ($OwnerSid -ne 'S-1-5-32-544') {
+        throw "Refusing C:\scripts because it is not owned by Administrators (S-1-5-32-544)."
+    }
+
+    return 'ResetDacl'
+}
+
+function Assert-ProtectedAclFacts {
+    param(
+        [Parameter(Mandatory = $true)]
+        [bool]$IsReparsePoint,
+
+        [string]$OwnerSid,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$InheritanceDisabled,
+
+        [string[]]$AllowSids
+    )
+
+    if ($IsReparsePoint) {
+        throw "Refusing the path because it is a reparse point (junction or symlink)."
+    }
+
+    if ($OwnerSid -ne 'S-1-5-32-544') {
+        throw "Refusing the path because it is not owned by Administrators (S-1-5-32-544)."
+    }
+
+    if (-not $InheritanceDisabled) {
+        throw "Refusing the path because ACL inheritance is enabled."
+    }
+
+    $expected = @('S-1-5-18', 'S-1-5-32-544')
+    $actual = @($AllowSids | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
+    if ($actual.Count -ne $expected.Count) {
+        throw "Refusing the path because its ACL is not limited to Administrators and SYSTEM."
+    }
+
+    foreach ($sid in $expected) {
+        if ($actual -notcontains $sid) {
+            throw "Refusing the path because its ACL is not limited to Administrators and SYSTEM."
+        }
+    }
+}
+
 function Assert-ChildPathInsideDirectory {
     param(
         [Parameter(Mandatory = $true)]
@@ -4609,9 +4674,11 @@ function Get-DownloadDirectoryFacts {
     )
 
     $isReparsePoint = $false
+    $isDirectory = $false
     try {
         $attributes = [System.IO.File]::GetAttributes($Path)
         $isReparsePoint = (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)
+        $isDirectory = (($attributes -band [System.IO.FileAttributes]::Directory) -ne 0)
     }
     catch {
         $inner = $_.Exception
@@ -4622,6 +4689,7 @@ function Get-DownloadDirectoryFacts {
             return [pscustomobject]@{
                 Exists         = $false
                 IsReparsePoint = $false
+                IsDirectory    = $false
                 OwnerSid       = $null
             }
         }
@@ -4637,8 +4705,183 @@ function Get-DownloadDirectoryFacts {
     return [pscustomobject]@{
         Exists         = $true
         IsReparsePoint = $isReparsePoint
+        IsDirectory    = $isDirectory
         OwnerSid       = $ownerSid
     }
+}
+
+function Initialize-FileSecurityTypes {
+    if ($env:OS -ne 'Windows_NT') {
+        throw "Protected ACLs require Windows."
+    }
+
+    if (-not ('System.Security.AccessControl.DirectorySecurity' -as [type])) {
+        Add-Type -AssemblyName System.IO.FileSystem.AccessControl -ErrorAction Stop
+    }
+}
+
+function Add-ProtectedAccessRules {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Security,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$InheritToChildren
+    )
+
+    $administratorsSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+    $systemSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+    $rights = [System.Security.AccessControl.FileSystemRights]::FullControl
+    $allow = [System.Security.AccessControl.AccessControlType]::Allow
+    foreach ($sid in @($administratorsSid, $systemSid)) {
+        if ($InheritToChildren) {
+            $inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+            $propagation = [System.Security.AccessControl.PropagationFlags]::None
+            $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+                $sid, $rights, $inheritance, $propagation, $allow)
+        }
+        else {
+            $rule = [System.Security.AccessControl.FileSystemAccessRule]::new($sid, $rights, $allow)
+        }
+        [void]$Security.AddAccessRule($rule)
+    }
+}
+
+function New-ProtectedDirectorySecurity {
+    $administratorsSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+    $security = [System.Security.AccessControl.DirectorySecurity]::new()
+    $security.SetOwner($administratorsSid)
+    $security.SetAccessRuleProtection($true, $false)
+    Add-ProtectedAccessRules -Security $security -InheritToChildren $true
+    return $security
+}
+
+function Set-ProtectedSecurityDescriptor {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$InheritToChildren
+    )
+
+    $administratorsSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+    $acl = Get-Acl -LiteralPath $Path
+    $acl.SetOwner($administratorsSid)
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($rule in @($acl.Access)) {
+        [void]$acl.RemoveAccessRule($rule)
+    }
+    Add-ProtectedAccessRules -Security $acl -InheritToChildren $InheritToChildren
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+function New-DirectoryWithProtectedAcl {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    Initialize-FileSecurityTypes
+    $security = New-ProtectedDirectorySecurity
+    if ($PSVersionTable.PSVersion.Major -ge 7) {
+        if (-not ('System.IO.FileSystemAclExtensions' -as [type])) {
+            Add-Type -AssemblyName System.IO.FileSystem.AccessControl -ErrorAction Stop
+        }
+        [void][System.IO.FileSystemAclExtensions]::CreateDirectory($security, $Path)
+    }
+    else {
+        [void][System.IO.Directory]::CreateDirectory($Path, $security)
+    }
+}
+
+function Reset-ProtectedDirectoryDacl {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    Initialize-FileSecurityTypes
+    Set-ProtectedSecurityDescriptor -Path $Path -InheritToChildren $true
+}
+
+function Get-ExplicitAllowSids {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $acl = Get-Acl -LiteralPath $Path
+    $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+    $allowSids = foreach ($rule in $rules) {
+        if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) {
+            throw "Refusing '$Path' because its ACL contains a deny entry."
+        }
+        $rule.IdentityReference.Value
+    }
+    return [pscustomobject]@{
+        InheritanceDisabled = [bool]$acl.AreAccessRulesProtected
+        AllowSids           = @($allowSids)
+    }
+}
+
+function Assert-ProtectedDirectoryAcl {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $facts = Get-DownloadDirectoryFacts -Path $Path
+    $aclFacts = Get-ExplicitAllowSids -Path $Path
+    Assert-ProtectedAclFacts -IsReparsePoint $facts.IsReparsePoint -OwnerSid $facts.OwnerSid -InheritanceDisabled $aclFacts.InheritanceDisabled -AllowSids $aclFacts.AllowSids
+}
+
+function Set-ProtectedFileAcl {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    Initialize-FileSecurityTypes
+    $facts = Get-DownloadDirectoryFacts -Path $Path
+    if (-not $facts.Exists) {
+        throw "Cannot protect a missing file: $Path"
+    }
+    if ($facts.IsReparsePoint) {
+        throw "Refusing to protect a reparse point: $Path"
+    }
+
+    # A same-volume move keeps the source owner and DACL, so replace both.
+    Set-ProtectedSecurityDescriptor -Path $Path -InheritToChildren $false
+
+    $updated = Get-DownloadDirectoryFacts -Path $Path
+    $aclFacts = Get-ExplicitAllowSids -Path $Path
+    Assert-ProtectedAclFacts -IsReparsePoint $updated.IsReparsePoint -OwnerSid $updated.OwnerSid -InheritanceDisabled $aclFacts.InheritanceDisabled -AllowSids $aclFacts.AllowSids
+}
+
+function Initialize-ProtectedScriptsDirectory {
+    param(
+        [string]$Path = 'C:\scripts'
+    )
+
+    if ($env:OS -ne 'Windows_NT') {
+        throw "Creating a protected scripts directory requires Windows."
+    }
+
+    Initialize-FileSecurityTypes
+    $facts = Get-DownloadDirectoryFacts -Path $Path
+    $action = Get-ScriptsDirectoryAction -Exists $facts.Exists -IsReparsePoint $facts.IsReparsePoint -IsDirectory $facts.IsDirectory -OwnerSid $facts.OwnerSid
+    if ($action -eq 'Create') {
+        New-DirectoryWithProtectedAcl -Path $Path
+    }
+    elseif ($action -eq 'ResetDacl') {
+        Reset-ProtectedDirectoryDacl -Path $Path
+    }
+    else {
+        throw "Unexpected scripts directory action '$action'."
+    }
+
+    Assert-ProtectedDirectoryAcl -Path $Path
 }
 
 function Remove-PythonDownloadDirectory {
@@ -4655,6 +4898,9 @@ function Remove-PythonDownloadDirectory {
     if ($facts.IsReparsePoint) {
         throw "Refusing to remove the Python download directory because it is a reparse point (junction or symlink)."
     }
+    if ($env:OS -eq 'Windows_NT' -and $facts.OwnerSid -ne 'S-1-5-32-544') {
+        throw "Refusing to remove the Python download directory because it is not owned by Administrators (S-1-5-32-544)."
+    }
 
     $children = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop)
     foreach ($child in $children) {
@@ -4667,6 +4913,42 @@ function Remove-PythonDownloadDirectory {
     Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
 }
 
+function Invoke-ActionPreservingOriginalError {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [scriptblock]$Action,
+
+        [Parameter(Mandatory = $true)]
+        [scriptblock]$Cleanup
+    )
+
+    $failure = $null
+    try {
+        & $Action
+    }
+    catch {
+        $failure = $_
+    }
+    finally {
+        try {
+            & $Cleanup
+        }
+        catch {
+            if ($null -eq $failure) {
+                $failure = $_
+            }
+            else {
+                Write-Warning ("The Python download directory could not be removed: " + $_.Exception.Message)
+            }
+        }
+    }
+
+    if ($null -ne $failure) {
+        $PSCmdlet.ThrowTerminatingError($failure)
+    }
+}
+
 function New-RestrictedPythonDownloadDirectory {
     if ($env:OS -ne 'Windows_NT') {
         throw "Creating a private Python download directory requires Windows."
@@ -4677,56 +4959,34 @@ function New-RestrictedPythonDownloadDirectory {
         throw "ProgramData is not set. Refusing to choose a Python download directory."
     }
 
-    if (-not ('System.Security.AccessControl.DirectorySecurity' -as [type])) {
-        Add-Type -AssemblyName System.IO.FileSystem.AccessControl -ErrorAction Stop
-    }
-
-    $administratorsSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
-    $systemSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+    Initialize-FileSecurityTypes
     $path = Join-Path $programData ('fsrm-python-' + [guid]::NewGuid().ToString('n'))
 
     $facts = Get-DownloadDirectoryFacts -Path $path
     Assert-ExistingDownloadDirectory -Exists $facts.Exists -IsReparsePoint $facts.IsReparsePoint -OwnerSid $facts.OwnerSid
 
-    # Inheritance is disabled so only these two ACEs apply to the new directory.
-    $security = [System.Security.AccessControl.DirectorySecurity]::new()
-    $security.SetOwner($administratorsSid)
-    $security.SetAccessRuleProtection($true, $false)
-
-    $rights = [System.Security.AccessControl.FileSystemRights]::FullControl
-    $inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
-    $propagation = [System.Security.AccessControl.PropagationFlags]::None
-    $allow = [System.Security.AccessControl.AccessControlType]::Allow
-    foreach ($sid in @($administratorsSid, $systemSid)) {
-        $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
-            $sid, $rights, $inheritance, $propagation, $allow)
-        [void]$security.AddAccessRule($rule)
-    }
-
-    if ($PSVersionTable.PSVersion.Major -ge 7) {
-        if (-not ('System.IO.FileSystemAclExtensions' -as [type])) {
-            Add-Type -AssemblyName System.IO.FileSystem.AccessControl -ErrorAction Stop
-        }
-        [void][System.IO.FileSystemAclExtensions]::CreateDirectory($security, $path)
-    }
-    else {
-        [void][System.IO.Directory]::CreateDirectory($path, $security)
-    }
+    New-DirectoryWithProtectedAcl -Path $path
 
     $createdFacts = Get-DownloadDirectoryFacts -Path $path
     try {
         Assert-DownloadDirectoryIsSafe -IsReparsePoint $createdFacts.IsReparsePoint -OwnerSid $createdFacts.OwnerSid
     }
     catch {
-        if (-not $createdFacts.IsReparsePoint) {
-            Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
-        }
+        # Do not delete a folder that is not owned by Administrators or is a reparse point.
         throw
     }
 
     return $path
 }
 
+Install-FSRMRansomware -SMTPServer $SMTPServer -EmailTo $EmailTo -EmailFrom $EmailFrom
+
+# Install supported Python 3.12 for Email.py.
+# Python 3.12.10 is the latest 3.12.x release published as a Windows installer on
+# python.org. Later 3.12 releases are source-only security updates.
+# Prefer winget when it is available. Otherwise download the official installer
+# into a new private directory and abort unless Get-FileHash matches the SHA256
+# published for that python.org file.
 $pythonVersion = "3.12.10"
 $pythonInstallerName = "python-$pythonVersion-amd64.exe"
 $pythonUrl = "https://www.python.org/ftp/python/$pythonVersion/$pythonInstallerName"
@@ -4745,15 +5005,15 @@ if ($wingetCommand) {
 }
 else {
     $downloadDirectory = $null
-    try {
-        $downloadDirectory = New-RestrictedPythonDownloadDirectory
-        $pythonInstallerPath = Join-Path $downloadDirectory $pythonInstallerName
-        Assert-ChildPathInsideDirectory -Directory $downloadDirectory -ChildPath $pythonInstallerPath
+    Invoke-ActionPreservingOriginalError -Action {
+        $script:downloadDirectory = New-RestrictedPythonDownloadDirectory
+        $pythonInstallerPath = Join-Path $script:downloadDirectory $pythonInstallerName
+        Assert-ChildPathInsideDirectory -Directory $script:downloadDirectory -ChildPath $pythonInstallerPath
 
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
         Invoke-WebRequest -Uri $pythonUrl -OutFile $pythonInstallerPath -UseBasicParsing -ErrorAction Stop
 
-        Assert-ChildPathInsideDirectory -Directory $downloadDirectory -ChildPath $pythonInstallerPath
+        Assert-ChildPathInsideDirectory -Directory $script:downloadDirectory -ChildPath $pythonInstallerPath
         $installerFacts = Get-DownloadDirectoryFacts -Path $pythonInstallerPath
         if ($installerFacts.IsReparsePoint) {
             throw "Refusing to run the Python installer because it is a reparse point (junction or symlink)."
@@ -4768,16 +5028,14 @@ else {
         if ($LASTEXITCODE -ne 0) {
             throw "Python $pythonVersion installer failed with exit code $LASTEXITCODE. Aborting."
         }
-    }
-    finally {
-        Remove-PythonDownloadDirectory -Path $downloadDirectory
+    } -Cleanup {
+        Remove-PythonDownloadDirectory -Path $script:downloadDirectory
     }
 }
 
 Write-Host "Python was installed. Open a new shell, or refresh PATH, before using python."
 
-if (-not (Test-Path -LiteralPath 'C:\scripts' -PathType Container)) {
-    New-Item -ItemType Directory -Path 'C:\scripts' -ErrorAction Stop | Out-Null
-}
+Initialize-ProtectedScriptsDirectory
 Start-Sleep -Seconds 2
 Move-Item -LiteralPath 'C:\FSRM\Email.py' -Destination 'C:\scripts\' -ErrorAction Stop
+Set-ProtectedFileAcl -Path 'C:\scripts\Email.py'
