@@ -4534,12 +4534,204 @@ Install-FSRMRansomware -SMTPServer $SMTPServer -EmailTo $EmailTo -EmailFrom $Ema
 # Python 3.12.10 is the latest 3.12.x release published as a Windows installer on
 # python.org. Later 3.12 releases are source-only security updates.
 # Prefer winget when it is available. Otherwise download the official installer
-# and abort unless Get-FileHash matches the SHA256 published for that python.org file.
+# into a new private directory and abort unless Get-FileHash matches the SHA256
+# published for that python.org file.
+
+function Assert-PythonInstallerSha256 {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$Sha256
+    )
+
+    if ($Sha256 -notmatch '^[0-9A-Fa-f]{64}$') {
+        throw "The Python installer SHA256 must be exactly 64 hexadecimal characters."
+    }
+}
+
+function Assert-DownloadDirectoryIsSafe {
+    param(
+        [Parameter(Mandatory = $true)]
+        [bool]$IsReparsePoint,
+
+        [string]$OwnerSid
+    )
+
+    if ($IsReparsePoint) {
+        throw "Refusing the Python download directory because it is a reparse point (junction or symlink)."
+    }
+
+    if ($OwnerSid -ne 'S-1-5-32-544') {
+        throw "Refusing the Python download directory because it is not owned by Administrators (S-1-5-32-544)."
+    }
+}
+
+function Assert-ExistingDownloadDirectory {
+    param(
+        [Parameter(Mandatory = $true)]
+        [bool]$Exists,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$IsReparsePoint,
+
+        [string]$OwnerSid
+    )
+
+    if (-not $Exists) {
+        return
+    }
+
+    Assert-DownloadDirectoryIsSafe -IsReparsePoint $IsReparsePoint -OwnerSid $OwnerSid
+    throw "Refusing the Python download directory because it already exists."
+}
+
+function Assert-ChildPathInsideDirectory {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Directory,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ChildPath
+    )
+
+    $directoryFull = [System.IO.Path]::GetFullPath($Directory)
+    $childFull = [System.IO.Path]::GetFullPath($ChildPath)
+    $prefix = $directoryFull.TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
+    if (-not $childFull.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "The Python installer path is outside the download directory."
+    }
+}
+
+function Get-DownloadDirectoryFacts {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $isReparsePoint = $false
+    try {
+        $attributes = [System.IO.File]::GetAttributes($Path)
+        $isReparsePoint = (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)
+    }
+    catch {
+        $inner = $_.Exception
+        while ($null -ne $inner.InnerException) {
+            $inner = $inner.InnerException
+        }
+        if ($inner -is [System.IO.FileNotFoundException] -or $inner -is [System.IO.DirectoryNotFoundException]) {
+            return [pscustomobject]@{
+                Exists         = $false
+                IsReparsePoint = $false
+                OwnerSid       = $null
+            }
+        }
+        throw
+    }
+
+    $ownerSid = $null
+    if (-not $isReparsePoint -and $env:OS -eq 'Windows_NT') {
+        $acl = Get-Acl -LiteralPath $Path
+        $ownerSid = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+    }
+
+    return [pscustomobject]@{
+        Exists         = $true
+        IsReparsePoint = $isReparsePoint
+        OwnerSid       = $ownerSid
+    }
+}
+
+function Remove-PythonDownloadDirectory {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return
+    }
+
+    $facts = Get-DownloadDirectoryFacts -Path $Path
+    if (-not $facts.Exists) {
+        return
+    }
+    if ($facts.IsReparsePoint) {
+        throw "Refusing to remove the Python download directory because it is a reparse point (junction or symlink)."
+    }
+
+    $children = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop)
+    foreach ($child in $children) {
+        $childFacts = Get-DownloadDirectoryFacts -Path $child.FullName
+        if ($childFacts.IsReparsePoint) {
+            throw "Refusing to remove '$($child.FullName)' because it is a reparse point (junction or symlink)."
+        }
+    }
+
+    Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+}
+
+function New-RestrictedPythonDownloadDirectory {
+    if ($env:OS -ne 'Windows_NT') {
+        throw "Creating a private Python download directory requires Windows."
+    }
+
+    $programData = $env:ProgramData
+    if ([string]::IsNullOrWhiteSpace($programData)) {
+        throw "ProgramData is not set. Refusing to choose a Python download directory."
+    }
+
+    if (-not ('System.Security.AccessControl.DirectorySecurity' -as [type])) {
+        Add-Type -AssemblyName System.IO.FileSystem.AccessControl -ErrorAction Stop
+    }
+
+    $administratorsSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+    $systemSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+    $path = Join-Path $programData ('fsrm-python-' + [guid]::NewGuid().ToString('n'))
+
+    $facts = Get-DownloadDirectoryFacts -Path $path
+    Assert-ExistingDownloadDirectory -Exists $facts.Exists -IsReparsePoint $facts.IsReparsePoint -OwnerSid $facts.OwnerSid
+
+    # Inheritance is disabled so only these two ACEs apply to the new directory.
+    $security = [System.Security.AccessControl.DirectorySecurity]::new()
+    $security.SetOwner($administratorsSid)
+    $security.SetAccessRuleProtection($true, $false)
+
+    $rights = [System.Security.AccessControl.FileSystemRights]::FullControl
+    $inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+    $propagation = [System.Security.AccessControl.PropagationFlags]::None
+    $allow = [System.Security.AccessControl.AccessControlType]::Allow
+    foreach ($sid in @($administratorsSid, $systemSid)) {
+        $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+            $sid, $rights, $inheritance, $propagation, $allow)
+        [void]$security.AddAccessRule($rule)
+    }
+
+    if ($PSVersionTable.PSVersion.Major -ge 7) {
+        if (-not ('System.IO.FileSystemAclExtensions' -as [type])) {
+            Add-Type -AssemblyName System.IO.FileSystem.AccessControl -ErrorAction Stop
+        }
+        [void][System.IO.FileSystemAclExtensions]::CreateDirectory($security, $path)
+    }
+    else {
+        [void][System.IO.Directory]::CreateDirectory($path, $security)
+    }
+
+    $createdFacts = Get-DownloadDirectoryFacts -Path $path
+    try {
+        Assert-DownloadDirectoryIsSafe -IsReparsePoint $createdFacts.IsReparsePoint -OwnerSid $createdFacts.OwnerSid
+    }
+    catch {
+        if (-not $createdFacts.IsReparsePoint) {
+            Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        throw
+    }
+
+    return $path
+}
+
 $pythonVersion = "3.12.10"
 $pythonInstallerName = "python-$pythonVersion-amd64.exe"
 $pythonUrl = "https://www.python.org/ftp/python/$pythonVersion/$pythonInstallerName"
 $pythonSha256 = "67B5635E80EA51072B87941312D00EC8927C4DB9BA18938F7AD2D27B328B95FB"
-$pythonInstallerPath = "C:\tmp\$pythonInstallerName"
+Assert-PythonInstallerSha256 -Sha256 $pythonSha256
 
 $wingetCommand = Get-Command winget -ErrorAction SilentlyContinue
 if ($wingetCommand) {
@@ -4552,23 +4744,40 @@ if ($wingetCommand) {
     }
 }
 else {
-    New-Item -ItemType Directory -Force -Path "C:\tmp" | Out-Null
-    if (-not (Test-Path -LiteralPath $pythonInstallerPath)) {
+    $downloadDirectory = $null
+    try {
+        $downloadDirectory = New-RestrictedPythonDownloadDirectory
+        $pythonInstallerPath = Join-Path $downloadDirectory $pythonInstallerName
+        Assert-ChildPathInsideDirectory -Directory $downloadDirectory -ChildPath $pythonInstallerPath
+
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
         Invoke-WebRequest -Uri $pythonUrl -OutFile $pythonInstallerPath -UseBasicParsing -ErrorAction Stop
-    }
 
-    $actualHash = (Get-FileHash -LiteralPath $pythonInstallerPath -Algorithm SHA256).Hash.ToUpperInvariant()
-    if ($actualHash -ne $pythonSha256) {
-        Remove-Item -LiteralPath $pythonInstallerPath -Force -ErrorAction SilentlyContinue
-        throw "SHA256 mismatch for $pythonInstallerName. Expected the official python.org SHA256 $pythonSha256 but Get-FileHash returned $actualHash. Aborting."
-    }
+        Assert-ChildPathInsideDirectory -Directory $downloadDirectory -ChildPath $pythonInstallerPath
+        $installerFacts = Get-DownloadDirectoryFacts -Path $pythonInstallerPath
+        if ($installerFacts.IsReparsePoint) {
+            throw "Refusing to run the Python installer because it is a reparse point (junction or symlink)."
+        }
 
-    & $pythonInstallerPath /quiet InstallAllUsers=1 PrependPath=1 Include_test=0
-    if ($LASTEXITCODE -ne 0) {
-        throw "Python $pythonVersion installer failed with exit code $LASTEXITCODE. Aborting."
+        $actualHash = (Get-FileHash -LiteralPath $pythonInstallerPath -Algorithm SHA256).Hash.ToUpperInvariant()
+        if ($actualHash -ne $pythonSha256.ToUpperInvariant()) {
+            throw "SHA256 mismatch for $pythonInstallerName. Expected the official python.org SHA256 $pythonSha256 but Get-FileHash returned $actualHash. Aborting."
+        }
+
+        & $pythonInstallerPath /quiet InstallAllUsers=1 PrependPath=1 Include_test=0
+        if ($LASTEXITCODE -ne 0) {
+            throw "Python $pythonVersion installer failed with exit code $LASTEXITCODE. Aborting."
+        }
+    }
+    finally {
+        Remove-PythonDownloadDirectory -Path $downloadDirectory
     }
 }
 
+Write-Host "Python was installed. Open a new shell, or refresh PATH, before using python."
+
+if (-not (Test-Path -LiteralPath 'C:\scripts' -PathType Container)) {
+    New-Item -ItemType Directory -Path 'C:\scripts' -ErrorAction Stop | Out-Null
+}
 Start-Sleep -Seconds 2
-Move-Item -Path "C:\FSRM\Email.py" -Destination "C:\scripts\"
+Move-Item -LiteralPath 'C:\FSRM\Email.py' -Destination 'C:\scripts\' -ErrorAction Stop
