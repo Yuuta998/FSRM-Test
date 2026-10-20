@@ -1,3 +1,30 @@
+<#
+.SYNOPSIS
+Configures an FSRM ransomware file screen and installs Python for alert email.
+.DESCRIPTION
+SMTPServer, EmailTo, and EmailFrom are required. This script does not embed example mail settings.
+.PARAMETER SMTPServer
+SMTP server used to send file-screen alert email.
+.PARAMETER EmailTo
+Address that receives file-screen alert email.
+.PARAMETER EmailFrom
+Address that file-screen alert email is sent from.
+#>
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true, HelpMessage = "SMTP server used to send file-screen alert email.")]
+    [ValidateNotNullOrEmpty()]
+    [string]$SMTPServer,
+
+    [Parameter(Mandatory = $true, HelpMessage = "Address that receives file-screen alert email.")]
+    [ValidateNotNullOrEmpty()]
+    [string]$EmailTo,
+
+    [Parameter(Mandatory = $true, HelpMessage = "Address that file-screen alert email is sent from.")]
+    [ValidateNotNullOrEmpty()]
+    [string]$EmailFrom
+)
+
 function Install-FSRMRansomware {
     <#
     .SYNOPSIS
@@ -10,22 +37,22 @@ function Install-FSRMRansomware {
     .PARAMETER EmailFrom
     Specify the email address that the email alerts are sent from. 
     #>
-#Email information is at line 4492 currently. 
-#Parameters I do not know if they work.
+# SMTPServer, EmailTo, and EmailFrom are required script parameters.
+# Pass them on the command line. Do not hard-code example addresses.
 
         [CmdletBinding()]
         param(
-             [Parameter(Mandatory=$True,
-                        HelpMessage= "")]
-            [String]$SMTPServer,
-            [Parameter(Mandatory=$True,
-                       HelpMessage= "")]
-            [String]$EmailTo,
-            [Parameter(Mandatory=$True,
-                       HelpMessage= "")]
-            [String]$EmailFrom
-    
-    
+            [Parameter(Mandatory = $true, HelpMessage = "SMTP server used to send file-screen alert email.")]
+            [ValidateNotNullOrEmpty()]
+            [string]$SMTPServer,
+
+            [Parameter(Mandatory = $true, HelpMessage = "Address that receives file-screen alert email.")]
+            [ValidateNotNullOrEmpty()]
+            [string]$EmailTo,
+
+            [Parameter(Mandatory = $true, HelpMessage = "Address that file-screen alert email is sent from.")]
+            [ValidateNotNullOrEmpty()]
+            [string]$EmailFrom
         )
         
         Process{
@@ -4499,25 +4526,49 @@ function Install-FSRMRansomware {
         }
    
 }
-# EmailTo can be changed to the email that will receive the email.
-# EmailFrom is the from address 
-# SMTPServer can be changed to the email server that your email account will use.
-# At this point the emailing part does not work to my knowledge.
-Install-FSRMRansomware -SMTPServer "smtp.office365.com" -EmailTo "EmailTo@email.com" -EmailFrom "EmailFrom@email.com"
-# Installing Python for Emailing add the Trusted switch
-$url = "https://www.python.org/ftp/python/3.7.6/python-3.7.6-amd64.exe"
-$output = "C:/tmp/python-3.7.6-amd64.exe"
+# SMTPServer, EmailTo, and EmailFrom are required parameters.
+# Supply them when running this script. Example addresses are not embedded here.
+Install-FSRMRansomware -SMTPServer $SMTPServer -EmailTo $EmailTo -EmailFrom $EmailFrom
 
-if (Test-Path $output) {
-    Write-Host "Script exists - skipping installation"
-    return;
-        }
-New-Item -ItemType Directory -Force -Path C:/tmp
+# Install supported Python 3.12 for Email.py.
+# Python 3.12.10 is the latest 3.12.x release published as a Windows installer on
+# python.org. Later 3.12 releases are source-only security updates.
+# Prefer winget when it is available. Otherwise download the official installer
+# and abort unless Get-FileHash matches the SHA256 published for that python.org file.
+$pythonVersion = "3.12.10"
+$pythonInstallerName = "python-$pythonVersion-amd64.exe"
+$pythonUrl = "https://www.python.org/ftp/python/$pythonVersion/$pythonInstallerName"
+$pythonSha256 = "67B5635E80EA51072B87941312D00EC8927C4DB9BA18938F7AD2D27B328B95FB"
+$pythonInstallerPath = "C:\tmp\$pythonInstallerName"
 
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-Invoke-WebRequest -Uri $url -OutFile $output
+$wingetCommand = Get-Command winget -ErrorAction SilentlyContinue
+if ($wingetCommand) {
+    Write-Host "Installing Python 3.12 with winget (Python.Python.3.12)"
+    & winget install --id Python.Python.3.12 -e --scope machine --accept-package-agreements --accept-source-agreements
+    # 0x8A15002B: no newer version. 0x8A150061: already installed.
+    $wingetAlreadyInstalled = @(-1978335189, -1978335135, 2316632107, 2316632161)
+    if ($LASTEXITCODE -ne 0 -and $wingetAlreadyInstalled -notcontains $LASTEXITCODE) {
+        throw "winget failed to install Python.Python.3.12 (exit code $LASTEXITCODE). Aborting."
+    }
+}
+else {
+    New-Item -ItemType Directory -Force -Path "C:\tmp" | Out-Null
+    if (-not (Test-Path -LiteralPath $pythonInstallerPath)) {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $pythonUrl -OutFile $pythonInstallerPath -UseBasicParsing -ErrorAction Stop
+    }
 
+    $actualHash = (Get-FileHash -LiteralPath $pythonInstallerPath -Algorithm SHA256).Hash.ToUpperInvariant()
+    if ($actualHash -ne $pythonSha256) {
+        Remove-Item -LiteralPath $pythonInstallerPath -Force -ErrorAction SilentlyContinue
+        throw "SHA256 mismatch for $pythonInstallerName. Expected the official python.org SHA256 $pythonSha256 but Get-FileHash returned $actualHash. Aborting."
+    }
 
-& $output /quiet InstallAllUsers=1 PrependPath=1 Include_test=0 
+    & $pythonInstallerPath /quiet InstallAllUsers=1 PrependPath=1 Include_test=0
+    if ($LASTEXITCODE -ne 0) {
+        throw "Python $pythonVersion installer failed with exit code $LASTEXITCODE. Aborting."
+    }
+}
+
 Start-Sleep -Seconds 2
 Move-Item -Path "C:\FSRM\Email.py" -Destination "C:\scripts\"
