@@ -25,6 +25,8 @@ param(
     [string]$EmailFrom
 )
 
+$ErrorActionPreference = 'Stop'
+
 function Install-FSRMRansomware {
     <#
     .SYNOPSIS
@@ -4509,10 +4511,13 @@ function Install-FSRMRansomware {
             # FSRM runs this script elevated. The directory must not inherit write
             # access from C:\, and an existing user-owned folder is refused.
             Initialize-ProtectedScriptsDirectory
-            $DenyPermissionsScript | Out-File -FilePath "C:\scripts\ScriptToDenyPermissions.PS1" -ErrorAction Stop
+            # Python imports from this directory first, so a leftover file must not
+            # be opened in place. Replace the deny script only after every child is safe.
+            $denyScriptPath = 'C:\scripts\ScriptToDenyPermissions.PS1'
+            Write-NewScriptFile -Path $denyScriptPath -Content $DenyPermissionsScript
             #unwblocks the script to allo for execution 
-            Unblock-file "C:\scripts\ScriptToDenyPermissions.PS1"
-            Set-ProtectedFileAcl -Path "C:\scripts\ScriptToDenyPermissions.PS1"
+            Unblock-file -LiteralPath $denyScriptPath
+            Set-ProtectedFileAcl -Path $denyScriptPath
 
             #find all drives that are not the C drive and create file screen for those drives. Essentially all drives except the C drive will be monitored for crypto locker files.
             $disks = GET-WMIOBJECT win32_logicaldisk -filter "DriveType='3'" | Where-Object {$_.deviceid -ne "C:"}
@@ -4859,6 +4864,318 @@ function Set-ProtectedFileAcl {
     Assert-ProtectedAclFacts -IsReparsePoint $updated.IsReparsePoint -OwnerSid $updated.OwnerSid -InheritanceDisabled $aclFacts.InheritanceDisabled -AllowSids $aclFacts.AllowSids
 }
 
+function Assert-ScriptsChildIsSafe {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$IsReparsePoint,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$IsDirectory,
+
+        $LinkCount,
+
+        [string]$OwnerSid,
+
+        [string[]]$ExplicitSids,
+
+        [bool]$HasDenyAce
+    )
+
+    if ($IsReparsePoint) {
+        throw "Refusing C:\scripts because '$Name' is a reparse point (junction or symlink). Remove it, then run this script again."
+    }
+
+    if ($IsDirectory) {
+        throw "Refusing C:\scripts because '$Name' is a subfolder. Remove it, then run this script again."
+    }
+
+    # Fail closed unless the link count is an integer equal to 1.
+    if (($LinkCount -isnot [int]) -or ($LinkCount -ne 1)) {
+        throw "Refusing C:\scripts because the link count for '$Name' is not 1. Remove extra hard links, then run this script again."
+    }
+
+    if ($OwnerSid -ne 'S-1-5-32-544' -and $OwnerSid -ne 'S-1-5-18') {
+        throw "Refusing C:\scripts because '$Name' is not owned by Administrators or SYSTEM. Remove it, then run this script again."
+    }
+
+    if ($HasDenyAce) {
+        throw "Refusing C:\scripts because '$Name' has an explicit deny ACE. Remove it, then run this script again."
+    }
+
+    $protectedSids = @('S-1-5-32-544', 'S-1-5-18')
+    foreach ($sid in @($ExplicitSids)) {
+        if ([string]::IsNullOrWhiteSpace($sid) -or ($protectedSids -notcontains $sid)) {
+            throw "Refusing C:\scripts because '$Name' has an explicit ACE for '$sid', outside the Administrators and SYSTEM set. Remove it, then run this script again."
+        }
+    }
+}
+
+function Get-DirectoryChildPathsWithoutFollowing {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    # Names only. This does not recurse through a child junction or symlink.
+    return @([System.IO.Directory]::EnumerateFileSystemEntries($Path))
+}
+
+function Initialize-FileHandleNative {
+    if ('FsrmScriptFileHandle' -as [type]) {
+        return
+    }
+
+    $typeDefinition = @'
+using System;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+public sealed class FsrmFileHandleFacts {
+    public int LinkCount { get; set; }
+    public bool IsReparsePoint { get; set; }
+    public bool IsDirectory { get; set; }
+}
+
+public static class FsrmScriptFileHandle {
+    private const uint FILE_READ_ATTRIBUTES = 0x0080;
+    private const uint FILE_SHARE_READ = 0x00000001;
+    private const uint FILE_SHARE_WRITE = 0x00000002;
+    private const uint FILE_SHARE_DELETE = 0x00000004;
+    private const uint OPEN_EXISTING = 3;
+    private const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
+    private const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
+    private const uint FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400;
+    private const uint FILE_ATTRIBUTE_DIRECTORY = 0x00000010;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ByHandleFileInformation {
+        public uint FileAttributes;
+        public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastAccessTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastWriteTime;
+        public uint VolumeSerialNumber;
+        public uint FileSizeHigh;
+        public uint FileSizeLow;
+        public uint NumberOfLinks;
+        public uint FileIndexHigh;
+        public uint FileIndexLow;
+    }
+
+    [DllImport("kernel32.dll", EntryPoint = "CreateFileW", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern SafeFileHandle CreateFile(
+        string lpFileName,
+        uint dwDesiredAccess,
+        uint dwShareMode,
+        IntPtr lpSecurityAttributes,
+        uint dwCreationDisposition,
+        uint dwFlagsAndAttributes,
+        IntPtr hTemplateFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetFileInformationByHandle(
+        SafeFileHandle hFile,
+        out ByHandleFileInformation lpFileInformation);
+
+    [DllImport("kernel32.dll", EntryPoint = "DeleteFileW", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool DeleteFile(string lpFileName);
+
+    public static FsrmFileHandleFacts Read(string path) {
+        SafeFileHandle handle = CreateFile(
+            path,
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            IntPtr.Zero,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            IntPtr.Zero);
+        if (handle == null || handle.IsInvalid) {
+            int error = Marshal.GetLastWin32Error();
+            if (handle != null) {
+                handle.Dispose();
+            }
+            if (error == 2 || error == 3) {
+                throw new FileNotFoundException("The file was not found.", path);
+            }
+            throw new Win32Exception(error);
+        }
+
+        try {
+            ByHandleFileInformation info;
+            if (!GetFileInformationByHandle(handle, out info)) {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+            if (info.NumberOfLinks > int.MaxValue) {
+                throw new InvalidOperationException("The link count does not fit in a 32-bit integer.");
+            }
+
+            FsrmFileHandleFacts facts = new FsrmFileHandleFacts();
+            facts.LinkCount = (int)info.NumberOfLinks;
+            facts.IsReparsePoint = (info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+            facts.IsDirectory = (info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            return facts;
+        }
+        finally {
+            handle.Dispose();
+        }
+    }
+
+    public static void Delete(string path) {
+        if (!DeleteFile(path)) {
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        }
+    }
+}
+'@
+
+    Add-Type -TypeDefinition $typeDefinition -Language CSharp -ErrorAction Stop
+}
+
+function Get-UnfollowedFileFacts {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    if ($env:OS -ne 'Windows_NT') {
+        throw "Reading a file without following links requires Windows."
+    }
+
+    Initialize-FileHandleNative
+    try {
+        $facts = [FsrmScriptFileHandle]::Read($Path)
+    }
+    catch {
+        $inner = $_.Exception
+        while ($null -ne $inner.InnerException) {
+            $inner = $inner.InnerException
+        }
+        if ($inner -is [System.IO.FileNotFoundException]) {
+            return $null
+        }
+        throw
+    }
+
+    $linkCount = $facts.LinkCount
+    if ($linkCount -isnot [int]) {
+        $linkCount = $null
+    }
+
+    return [pscustomobject]@{
+        Exists         = $true
+        LinkCount      = $linkCount
+        IsReparsePoint = [bool]$facts.IsReparsePoint
+        IsDirectory    = [bool]$facts.IsDirectory
+    }
+}
+
+function Get-ExplicitAceSummary {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    Initialize-FileSecurityTypes
+    $identifier = [System.Security.Principal.SecurityIdentifier]
+    $acl = Get-Acl -LiteralPath $Path
+    $rules = @($acl.GetAccessRules($true, $false, $identifier))
+    $sids = New-Object System.Collections.Generic.List[string]
+    $hasDeny = $false
+    foreach ($rule in $rules) {
+        if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) {
+            $hasDeny = $true
+        }
+        [void]$sids.Add([string]$rule.IdentityReference.Value)
+    }
+
+    return [pscustomobject]@{
+        OwnerSid     = $acl.GetOwner($identifier).Value
+        ExplicitSids = @($sids)
+        HasDenyAce   = [bool]$hasDeny
+    }
+}
+
+function Assert-ScriptsDirectoryChildren {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Directory
+    )
+
+    foreach ($child in @(Get-DirectoryChildPathsWithoutFollowing -Path $Directory)) {
+        if ([string]::IsNullOrWhiteSpace($child)) {
+            continue
+        }
+
+        $name = [System.IO.Path]::GetFileName($child)
+        $handle = Get-UnfollowedFileFacts -Path $child
+        if ($null -eq $handle) {
+            throw "Refusing C:\scripts because '$name' disappeared while it was being checked. Run this script again."
+        }
+
+        $ownerSid = $null
+        $explicitSids = @()
+        $hasDeny = $false
+        if (-not $handle.IsReparsePoint -and -not $handle.IsDirectory -and ($handle.LinkCount -is [int]) -and ($handle.LinkCount -eq 1)) {
+            $acl = Get-ExplicitAceSummary -Path $child
+            $ownerSid = $acl.OwnerSid
+            $explicitSids = $acl.ExplicitSids
+            $hasDeny = $acl.HasDenyAce
+        }
+
+        Assert-ScriptsChildIsSafe -Name $name -IsReparsePoint $handle.IsReparsePoint -IsDirectory $handle.IsDirectory -LinkCount $handle.LinkCount -OwnerSid $ownerSid -ExplicitSids $explicitSids -HasDenyAce $hasDeny
+    }
+}
+
+function Write-NewScriptFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$Content
+    )
+
+    if ($env:OS -ne 'Windows_NT') {
+        throw "Creating a script file requires Windows."
+    }
+
+    $handle = Get-UnfollowedFileFacts -Path $Path
+    if ($null -ne $handle) {
+        $name = [System.IO.Path]::GetFileName($Path)
+        $ownerSid = $null
+        $explicitSids = @()
+        $hasDeny = $false
+        if (-not $handle.IsReparsePoint -and -not $handle.IsDirectory -and ($handle.LinkCount -is [int]) -and ($handle.LinkCount -eq 1)) {
+            $acl = Get-ExplicitAceSummary -Path $Path
+            $ownerSid = $acl.OwnerSid
+            $explicitSids = $acl.ExplicitSids
+            $hasDeny = $acl.HasDenyAce
+        }
+
+        Assert-ScriptsChildIsSafe -Name $name -IsReparsePoint $handle.IsReparsePoint -IsDirectory $handle.IsDirectory -LinkCount $handle.LinkCount -OwnerSid $ownerSid -ExplicitSids $explicitSids -HasDenyAce $hasDeny
+        [FsrmScriptFileHandle]::Delete($Path)
+    }
+
+    $stream = [System.IO.File]::Open(
+        $Path,
+        [System.IO.FileMode]::CreateNew,
+        [System.IO.FileAccess]::Write,
+        [System.IO.FileShare]::None)
+    try {
+        $encoding = [System.Text.UTF8Encoding]::new($false)
+        $bytes = $encoding.GetBytes($Content)
+        $stream.Write($bytes, 0, $bytes.Length)
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
 function Initialize-ProtectedScriptsDirectory {
     param(
         [string]$Path = 'C:\scripts'
@@ -4876,6 +5193,8 @@ function Initialize-ProtectedScriptsDirectory {
     }
     elseif ($action -eq 'ResetDacl') {
         Reset-ProtectedDirectoryDacl -Path $Path
+        # Lock the directory first, then refuse leftover children before any script is reused.
+        Assert-ScriptsDirectoryChildren -Directory $Path
     }
     else {
         throw "Unexpected scripts directory action '$action'."
