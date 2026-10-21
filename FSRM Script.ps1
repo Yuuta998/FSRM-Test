@@ -4800,16 +4800,6 @@ function New-DirectoryWithProtectedAcl {
     }
 }
 
-function Reset-ProtectedDirectoryDacl {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Path
-    )
-
-    Initialize-FileSecurityTypes
-    Set-ProtectedSecurityDescriptor -Path $Path -InheritToChildren $true
-}
-
 function Get-ExplicitAllowSids {
     param(
         [Parameter(Mandatory = $true)]
@@ -4879,10 +4869,22 @@ function Assert-ScriptsChildIsSafe {
 
         [string]$OwnerSid,
 
-        [string[]]$ExplicitSids,
+        [string[]]$AceSids,
 
         [bool]$HasDenyAce
     )
+
+    $allowedNames = @('Email.py', 'ScriptToDenyPermissions.PS1')
+    $nameAllowed = $false
+    foreach ($candidate in $allowedNames) {
+        if ([string]::Equals($Name, $candidate, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $nameAllowed = $true
+            break
+        }
+    }
+    if (-not $nameAllowed) {
+        throw "Refusing C:\scripts because '$Name' is not one of the allowed files (Email.py, ScriptToDenyPermissions.PS1). Remove it, then run this script again."
+    }
 
     if ($IsReparsePoint) {
         throw "Refusing C:\scripts because '$Name' is a reparse point (junction or symlink). Remove it, then run this script again."
@@ -4902,13 +4904,13 @@ function Assert-ScriptsChildIsSafe {
     }
 
     if ($HasDenyAce) {
-        throw "Refusing C:\scripts because '$Name' has an explicit deny ACE. Remove it, then run this script again."
+        throw "Refusing C:\scripts because '$Name' has a deny ACE. Remove it, then run this script again."
     }
 
     $protectedSids = @('S-1-5-32-544', 'S-1-5-18')
-    foreach ($sid in @($ExplicitSids)) {
+    foreach ($sid in @($AceSids)) {
         if ([string]::IsNullOrWhiteSpace($sid) -or ($protectedSids -notcontains $sid)) {
-            throw "Refusing C:\scripts because '$Name' has an explicit ACE for '$sid', outside the Administrators and SYSTEM set. Remove it, then run this script again."
+            throw "Refusing C:\scripts because '$Name' has an ACE for '$sid', outside the Administrators and SYSTEM set. Remove it, then run this script again."
         }
     }
 }
@@ -4933,6 +4935,8 @@ using System;
 using System.ComponentModel;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using Microsoft.Win32.SafeHandles;
 
 public sealed class FsrmFileHandleFacts {
@@ -4951,6 +4955,14 @@ public static class FsrmScriptFileHandle {
     private const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
     private const uint FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400;
     private const uint FILE_ATTRIBUTE_DIRECTORY = 0x00000010;
+    private const uint READ_CONTROL = 0x00020000;
+    private const uint WRITE_DAC = 0x00040000;
+    private const uint WRITE_OWNER = 0x00080000;
+    private const uint OWNER_SECURITY_INFORMATION = 0x00000001;
+    private const uint DACL_SECURITY_INFORMATION = 0x00000004;
+    private const uint PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000;
+    private const uint SE_FILE_OBJECT = 1;
+    private const int FILE_FULL_CONTROL = 0x1F01FF;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct ByHandleFileInformation {
@@ -4983,6 +4995,16 @@ public static class FsrmScriptFileHandle {
 
     [DllImport("kernel32.dll", EntryPoint = "DeleteFileW", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern bool DeleteFile(string lpFileName);
+
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern uint SetSecurityInfo(
+        SafeFileHandle handle,
+        uint objectType,
+        uint securityInfo,
+        IntPtr owner,
+        IntPtr group,
+        IntPtr dacl,
+        IntPtr sacl);
 
     public static FsrmFileHandleFacts Read(string path) {
         SafeFileHandle handle = CreateFile(
@@ -5027,6 +5049,68 @@ public static class FsrmScriptFileHandle {
     public static void Delete(string path) {
         if (!DeleteFile(path)) {
             throw new Win32Exception(Marshal.GetLastWin32Error());
+        }
+    }
+
+    public static void ProtectDirectory(string path) {
+        SafeFileHandle handle = CreateFile(
+            path,
+            READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            IntPtr.Zero,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            IntPtr.Zero);
+        if (handle == null || handle.IsInvalid) {
+            int error = Marshal.GetLastWin32Error();
+            if (handle != null) {
+                handle.Dispose();
+            }
+            throw new Win32Exception(error);
+        }
+
+        try {
+            ByHandleFileInformation info;
+            if (!GetFileInformationByHandle(handle, out info)) {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+            if ((info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+                throw new InvalidOperationException("Refusing C:\\scripts because it is a reparse point (junction or symlink).");
+            }
+
+            SecurityIdentifier administrators = new SecurityIdentifier("S-1-5-32-544");
+            SecurityIdentifier system = new SecurityIdentifier("S-1-5-18");
+            RawAcl acl = new RawAcl(GenericAcl.AclRevision, 2);
+            AceFlags inherit = AceFlags.ContainerInherit | AceFlags.ObjectInherit;
+            acl.InsertAce(acl.Count, new CommonAce(inherit, AceQualifier.AccessAllowed, FILE_FULL_CONTROL, administrators, false, null));
+            acl.InsertAce(acl.Count, new CommonAce(inherit, AceQualifier.AccessAllowed, FILE_FULL_CONTROL, system, false, null));
+
+            byte[] ownerBytes = new byte[administrators.BinaryLength];
+            administrators.GetBinaryForm(ownerBytes, 0);
+            byte[] daclBytes = new byte[acl.BinaryLength];
+            acl.GetBinaryForm(daclBytes, 0);
+            GCHandle ownerHandle = GCHandle.Alloc(ownerBytes, GCHandleType.Pinned);
+            GCHandle daclHandle = GCHandle.Alloc(daclBytes, GCHandleType.Pinned);
+            try {
+                uint result = SetSecurityInfo(
+                    handle,
+                    SE_FILE_OBJECT,
+                    OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    ownerHandle.AddrOfPinnedObject(),
+                    IntPtr.Zero,
+                    daclHandle.AddrOfPinnedObject(),
+                    IntPtr.Zero);
+                if (result != 0) {
+                    throw new Win32Exception((int)result);
+                }
+            }
+            finally {
+                ownerHandle.Free();
+                daclHandle.Free();
+            }
+        }
+        finally {
+            handle.Dispose();
         }
     }
 }
@@ -5082,7 +5166,8 @@ function Get-ExplicitAceSummary {
     Initialize-FileSecurityTypes
     $identifier = [System.Security.Principal.SecurityIdentifier]
     $acl = Get-Acl -LiteralPath $Path
-    $rules = @($acl.GetAccessRules($true, $false, $identifier))
+    # Include inherited ACEs. A leftover file can still grant write access through one.
+    $rules = @($acl.GetAccessRules($true, $true, $identifier))
     $sids = New-Object System.Collections.Generic.List[string]
     $hasDeny = $false
     foreach ($rule in $rules) {
@@ -5093,9 +5178,9 @@ function Get-ExplicitAceSummary {
     }
 
     return [pscustomobject]@{
-        OwnerSid     = $acl.GetOwner($identifier).Value
-        ExplicitSids = @($sids)
-        HasDenyAce   = [bool]$hasDeny
+        OwnerSid   = $acl.GetOwner($identifier).Value
+        AceSids    = @($sids)
+        HasDenyAce = [bool]$hasDeny
     }
 }
 
@@ -5117,16 +5202,16 @@ function Assert-ScriptsDirectoryChildren {
         }
 
         $ownerSid = $null
-        $explicitSids = @()
+        $aceSids = @()
         $hasDeny = $false
         if (-not $handle.IsReparsePoint -and -not $handle.IsDirectory -and ($handle.LinkCount -is [int]) -and ($handle.LinkCount -eq 1)) {
             $acl = Get-ExplicitAceSummary -Path $child
             $ownerSid = $acl.OwnerSid
-            $explicitSids = $acl.ExplicitSids
+            $aceSids = $acl.AceSids
             $hasDeny = $acl.HasDenyAce
         }
 
-        Assert-ScriptsChildIsSafe -Name $name -IsReparsePoint $handle.IsReparsePoint -IsDirectory $handle.IsDirectory -LinkCount $handle.LinkCount -OwnerSid $ownerSid -ExplicitSids $explicitSids -HasDenyAce $hasDeny
+        Assert-ScriptsChildIsSafe -Name $name -IsReparsePoint $handle.IsReparsePoint -IsDirectory $handle.IsDirectory -LinkCount $handle.LinkCount -OwnerSid $ownerSid -AceSids $aceSids -HasDenyAce $hasDeny
     }
 }
 
@@ -5148,16 +5233,16 @@ function Write-NewScriptFile {
     if ($null -ne $handle) {
         $name = [System.IO.Path]::GetFileName($Path)
         $ownerSid = $null
-        $explicitSids = @()
+        $aceSids = @()
         $hasDeny = $false
         if (-not $handle.IsReparsePoint -and -not $handle.IsDirectory -and ($handle.LinkCount -is [int]) -and ($handle.LinkCount -eq 1)) {
             $acl = Get-ExplicitAceSummary -Path $Path
             $ownerSid = $acl.OwnerSid
-            $explicitSids = $acl.ExplicitSids
+            $aceSids = $acl.AceSids
             $hasDeny = $acl.HasDenyAce
         }
 
-        Assert-ScriptsChildIsSafe -Name $name -IsReparsePoint $handle.IsReparsePoint -IsDirectory $handle.IsDirectory -LinkCount $handle.LinkCount -OwnerSid $ownerSid -ExplicitSids $explicitSids -HasDenyAce $hasDeny
+        Assert-ScriptsChildIsSafe -Name $name -IsReparsePoint $handle.IsReparsePoint -IsDirectory $handle.IsDirectory -LinkCount $handle.LinkCount -OwnerSid $ownerSid -AceSids $aceSids -HasDenyAce $hasDeny
         [FsrmScriptFileHandle]::Delete($Path)
     }
 
@@ -5176,6 +5261,91 @@ function Write-NewScriptFile {
     }
 }
 
+function Get-EmailFileReplacementPlan {
+    param(
+        [Parameter(Mandatory = $true)]
+        [bool]$SourceExists,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$DestinationExists
+    )
+
+    if (-not $SourceExists) {
+        throw "Cannot replace C:\scripts\Email.py because C:\FSRM\Email.py is missing. The existing script was left unchanged."
+    }
+
+    if ($DestinationExists) {
+        return 'DeleteThenCreate'
+    }
+
+    return 'Create'
+}
+
+function Set-ScriptsDirectorySecurityByHandle {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    if ($env:OS -ne 'Windows_NT') {
+        throw "Protecting C:\scripts requires Windows."
+    }
+
+    Initialize-FileHandleNative
+    [FsrmScriptFileHandle]::ProtectDirectory($Path)
+}
+
+function Install-ProtectedEmailScript {
+    param(
+        [string]$SourcePath = 'C:\FSRM\Email.py',
+        [string]$DestinationPath = 'C:\scripts\Email.py'
+    )
+
+    if ($env:OS -ne 'Windows_NT') {
+        throw "Replacing Email.py requires Windows."
+    }
+
+    $sourceFacts = Get-UnfollowedFileFacts -Path $SourcePath
+    $destinationFacts = Get-UnfollowedFileFacts -Path $DestinationPath
+    $plan = Get-EmailFileReplacementPlan -SourceExists ($null -ne $sourceFacts) -DestinationExists ($null -ne $destinationFacts)
+    if ($sourceFacts.IsReparsePoint -or $sourceFacts.IsDirectory) {
+        throw "Refusing to read '$SourcePath' because it is a reparse point or a directory."
+    }
+
+    # Read the new script before removing the copy FSRM is already running.
+    $bytes = [System.IO.File]::ReadAllBytes($SourcePath)
+    if ($plan -eq 'DeleteThenCreate') {
+        $name = [System.IO.Path]::GetFileName($DestinationPath)
+        $ownerSid = $null
+        $aceSids = @()
+        $hasDeny = $false
+        if (-not $destinationFacts.IsReparsePoint -and -not $destinationFacts.IsDirectory -and ($destinationFacts.LinkCount -is [int]) -and ($destinationFacts.LinkCount -eq 1)) {
+            $acl = Get-ExplicitAceSummary -Path $DestinationPath
+            $ownerSid = $acl.OwnerSid
+            $aceSids = $acl.AceSids
+            $hasDeny = $acl.HasDenyAce
+        }
+
+        Assert-ScriptsChildIsSafe -Name $name -IsReparsePoint $destinationFacts.IsReparsePoint -IsDirectory $destinationFacts.IsDirectory -LinkCount $destinationFacts.LinkCount -OwnerSid $ownerSid -AceSids $aceSids -HasDenyAce $hasDeny
+        [FsrmScriptFileHandle]::Delete($DestinationPath)
+    }
+
+    $stream = [System.IO.File]::Open(
+        $DestinationPath,
+        [System.IO.FileMode]::CreateNew,
+        [System.IO.FileAccess]::Write,
+        [System.IO.FileShare]::None)
+    try {
+        $stream.Write($bytes, 0, $bytes.Length)
+    }
+    finally {
+        $stream.Dispose()
+    }
+
+    Set-ProtectedFileAcl -Path $DestinationPath
+    [FsrmScriptFileHandle]::Delete($SourcePath)
+}
+
 function Initialize-ProtectedScriptsDirectory {
     param(
         [string]$Path = 'C:\scripts'
@@ -5192,8 +5362,8 @@ function Initialize-ProtectedScriptsDirectory {
         New-DirectoryWithProtectedAcl -Path $Path
     }
     elseif ($action -eq 'ResetDacl') {
-        Reset-ProtectedDirectoryDacl -Path $Path
-        # Lock the directory first, then refuse leftover children before any script is reused.
+        # One open of this directory: reject a junction, then set the owner and DACL on that handle.
+        Set-ScriptsDirectorySecurityByHandle -Path $Path
         Assert-ScriptsDirectoryChildren -Directory $Path
     }
     else {
@@ -5356,5 +5526,4 @@ Write-Host "Python was installed. Open a new shell, or refresh PATH, before usin
 
 Initialize-ProtectedScriptsDirectory
 Start-Sleep -Seconds 2
-Move-Item -LiteralPath 'C:\FSRM\Email.py' -Destination 'C:\scripts\' -ErrorAction Stop
-Set-ProtectedFileAcl -Path 'C:\scripts\Email.py'
+Install-ProtectedEmailScript
