@@ -5510,6 +5510,21 @@ function Write-NewScriptFile {
     finally {
         $stream.Dispose()
     }
+
+    # Windows keeps the old creation time when a name is deleted and created again.
+    Set-ReplacedFileTimestamp -Path $Path
+}
+
+function Set-ReplacedFileTimestamp {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $item = Get-Item -LiteralPath $Path -Force
+    $stamp = [datetime]::UtcNow
+    $item.CreationTimeUtc = $stamp
+    $item.LastWriteTimeUtc = $stamp
 }
 
 function Get-EmailFileReplacementPlan {
@@ -5722,6 +5737,7 @@ function Install-ProtectedEmailScript {
         $stream.Dispose()
     }
 
+    Set-ReplacedFileTimestamp -Path $DestinationPath
     Set-ProtectedFileAcl -Path $DestinationPath
     [FsrmScriptFileHandle]::Delete($SourcePath)
 }
