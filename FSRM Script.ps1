@@ -4481,32 +4481,24 @@ function Install-FSRMRansomware {
                 if ((Get-FsrmSetupAction -Exists ($null -ne $existingRansomwareGroup)) -eq 'Create') {
                     New-FsrmFileGroup -Name "Ransomware Files" -IncludePattern $ransomwareIncludePattern
                 } else {
-                    Set-FsrmFileGroup -Name "Ransomware Files" -IncludePattern $ransomwareIncludePattern
+                    # Clear any ExcludePattern so an exclusion cannot hide ransomware extensions.
+                    Set-FsrmFileGroup -Name "Ransomware Files" -IncludePattern $ransomwareIncludePattern -ExcludePattern @()
                 }
+
+            # CurrentSid records who created the command action. Use the account running
+            # this setup instead of a SID copied from one host.
+            $templateCurrentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 
             #Create FSRM Template xml file and import template then remove xml file
             $FSRMTemplate = @"
-<?xml version="1.0" ?><Root ><Header DatabaseVersion = '2.0' ></Header><QuotaTemplates ></QuotaTemplates><DatascreenTemplates ><DatascreenTemplate Name = 'RansomwareCheck' Id = '{122F5AB4-9DF0-4F09-B89E-0F7BDC9D46CC}' Flags = '1' Description = '' ><BlockedGroups ><FileGroup FileGroupId = '{82D08F60-7319-4BE2-8621-066DB91A958E}' Name = 'Ransomware%sFiles' ></FileGroup></BlockedGroups><FileGroupActions ><Action Type="1" Id="{73AFB339-FF17-42DC-B9B9-E7C9A8E7C9A9}" EventType="2" MessageText="User%s[Source%sIo%sOwner]%sattempted%sto%ssave%s[Source%sFile%sPath]%sto%s[File%sScreen%sPath]%son%sthe%s[Server]%sserver.%sThis%sfile%sis%sin%sthe%s[Violated%sFile%sGroup]%sfile%sgroup,%swhich%sis%snot%spermitted%son%sthe%sserver." /><Action Type="3" Id="{D0B80CC5-E6DD-481C-9534-19944A851A72}" ExecutablePath="C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" Arguments="&quot;C:\Scripts\ScriptToDenyPermissions.PS1&quot;" WorkingDirectory="C:\Windows\System32\WindowsPowerShell\v1.0\" Account="3" MonitorCommand="0" KillTimeOut="0" LogResult="1" CurrentSid="S-1-5-21-3468280891-3112941812-1175424509-500" /></FileGroupActions></DatascreenTemplate></DatascreenTemplates><FileGroups ></FileGroups></Root>
+<?xml version="1.0" ?><Root ><Header DatabaseVersion = '2.0' ></Header><QuotaTemplates ></QuotaTemplates><DatascreenTemplates ><DatascreenTemplate Name = 'RansomwareCheck' Id = '{122F5AB4-9DF0-4F09-B89E-0F7BDC9D46CC}' Flags = '1' Description = '' ><BlockedGroups ><FileGroup FileGroupId = '{82D08F60-7319-4BE2-8621-066DB91A958E}' Name = 'Ransomware%sFiles' ></FileGroup></BlockedGroups><FileGroupActions ><Action Type="1" Id="{73AFB339-FF17-42DC-B9B9-E7C9A8E7C9A9}" EventType="2" MessageText="User%s[Source%sIo%sOwner]%sattempted%sto%ssave%s[Source%sFile%sPath]%sto%s[File%sScreen%sPath]%son%sthe%s[Server]%sserver.%sThis%sfile%sis%sin%sthe%s[Violated%sFile%sGroup]%sfile%sgroup,%swhich%sis%snot%spermitted%son%sthe%sserver." /><Action Type="3" Id="{D0B80CC5-E6DD-481C-9534-19944A851A72}" ExecutablePath="C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" Arguments="&quot;C:\Scripts\ScriptToDenyPermissions.PS1&quot;" WorkingDirectory="C:\Windows\System32\WindowsPowerShell\v1.0\" Account="3" MonitorCommand="0" KillTimeOut="0" LogResult="1" CurrentSid="$templateCurrentSid" /></FileGroupActions></DatascreenTemplate></DatascreenTemplates><FileGroups ></FileGroups></Root>
 "@
-            $existingScreenTemplate = $null
-            try {
-                $existingScreenTemplate = Get-FsrmFileScreenTemplate -Name "RansomwareCheck" -ErrorAction Stop
-            } catch {
-                if (-not (Test-FsrmObjectIsMissing -Message $_.Exception.Message -ErrorId $_.FullyQualifiedErrorId -Category ([string]$_.CategoryInfo.Category))) {
-                    throw
-                }
-            }
-            if ((Get-FsrmSetupAction -Exists ($null -ne $existingScreenTemplate)) -eq 'Create') {
-                $fsrmTemplatePath = "C:\Users\Public\FSRMTemplate.xml"
-                # filescrn.exe rejects a UTF-8 template. Unicode is UTF-16LE.
-                $FSRMTemplate | Out-File -FilePath $fsrmTemplatePath -Encoding Unicode
-                try {
-                    & filescrn.exe template import "/file:$fsrmTemplatePath"
-                    Assert-NativeCommandSucceeded -CommandName "filescrn template import" -ExitCode $LASTEXITCODE
-                } finally {
-                    Remove-Item -LiteralPath $fsrmTemplatePath -Force -ErrorAction SilentlyContinue
-                }
-            } 
+            # The template's command runs as SYSTEM. Always re-import it with /overwrite so a
+            # tampered existing template is replaced, then verify the result.
+            # The XML goes into the Administrators/SYSTEM-only C:\scripts, never C:\Users\Public.
+            Initialize-ProtectedScriptsDirectory
+            Import-RansomwareCheckTemplate -TemplateXml $FSRMTemplate -Directory 'C:\scripts'
+            Assert-RansomwareCheckTemplate
 
 
             #Creates Script Block to perform email message and block SMB Permissions. Exports script block to a PS1 for the File Screen Template.
@@ -4558,7 +4550,14 @@ function Install-FSRMRansomware {
                                             }
                                         }
                                         if ((Get-FsrmSetupAction -Exists ($null -ne $existingScreen)) -eq 'Create') {
-                                            New-FsrmFileScreen -Path $screenPath -Template "RansomwareCheck"
+                                            New-FsrmFileScreen -Path $screenPath -Template "RansomwareCheck" -Active
+                                        } elseif (-not (Test-RansomwareFileScreenIsExpected -Screen $existingScreen)) {
+                                            # A passive screen or another template would not block or run the deny script.
+                                            Set-FsrmFileScreen -Path $screenPath -Template "RansomwareCheck" -Active -IncludeGroup @("Ransomware Files")
+                                        }
+                                        $finalScreen = Get-FsrmFileScreen -Path $screenPath -ErrorAction Stop
+                                        if (-not (Test-RansomwareFileScreenIsExpected -Screen $finalScreen)) {
+                                            throw "File screen $screenPath does not use the active RansomwareCheck template with the Ransomware Files group."
                                         }
 
                                      }
@@ -4570,6 +4569,120 @@ function Install-FSRMRansomware {
 }
 # SMTPServer, EmailTo, and EmailFrom are required parameters.
 # Supply them when running this script. Example addresses are not embedded here.
+
+function Test-RansomwareFileScreenIsExpected {
+    param($Screen)
+
+    if ($null -eq $Screen) {
+        return $false
+    }
+    $groups = @($Screen.IncludeGroup)
+    return [bool](($Screen.Template -eq 'RansomwareCheck') -and ($Screen.Active -eq $true) -and ($groups.Count -eq 1) -and ($groups[0] -eq 'Ransomware Files'))
+}
+
+function Write-NewTemplateFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Content
+    )
+
+    # CreateNew fails if anything already has this name, so a planted file is never reused.
+    $stream = [System.IO.File]::Open(
+        $Path,
+        [System.IO.FileMode]::CreateNew,
+        [System.IO.FileAccess]::Write,
+        [System.IO.FileShare]::None)
+    try {
+        # filescrn.exe rejects a UTF-8 template. Write UTF-16LE with a BOM.
+        $encoding = [System.Text.UnicodeEncoding]::new($false, $true)
+        $preamble = $encoding.GetPreamble()
+        $bytes = $encoding.GetBytes($Content)
+        $stream.Write($preamble, 0, $preamble.Length)
+        $stream.Write($bytes, 0, $bytes.Length)
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
+function Import-RansomwareCheckTemplate {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TemplateXml,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Directory
+    )
+
+    Assert-ProtectedDirectoryAcl -Path $Directory
+    $templatePath = Join-Path $Directory ('FSRMTemplate-' + [guid]::NewGuid().ToString('n') + '.xml')
+    Assert-ChildPathInsideDirectory -Directory $Directory -ChildPath $templatePath
+    $created = $false
+    try {
+        Write-NewTemplateFile -Path $templatePath -Content $TemplateXml
+        $created = $true
+        Set-ProtectedFileAcl -Path $templatePath
+        & filescrn.exe template import "/file:$templatePath" /template:RansomwareCheck /overwrite
+        Assert-NativeCommandSucceeded -CommandName "filescrn template import" -ExitCode $LASTEXITCODE
+    }
+    finally {
+        if ($created) {
+            Remove-Item -LiteralPath $templatePath -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Assert-RansomwareCheckTemplate {
+    $template = Get-FsrmFileScreenTemplate -Name 'RansomwareCheck' -ErrorAction Stop
+    $groups = @($template.IncludeGroup)
+    if (($groups.Count -ne 1) -or ($groups[0] -ne 'Ransomware Files')) {
+        throw "RansomwareCheck template does not block exactly the Ransomware Files group."
+    }
+    if ($template.Active -ne $true) {
+        throw "RansomwareCheck template is not active."
+    }
+    $commands = @($template.Notification | Where-Object { [string]$_.Type -eq 'Command' })
+    if ($commands.Count -ne 1) {
+        throw "RansomwareCheck template must have exactly one command action; found $($commands.Count)."
+    }
+    $cmd = $commands[0]
+    $expected = [ordered]@{
+        Command          = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
+        CommandParameters = 'C:\Scripts\ScriptToDenyPermissions.PS1'
+        WorkingDirectory = 'C:\Windows\System32\WindowsPowerShell\v1.0'
+        SecurityLevel    = 'LocalSystem'
+    }
+    $actual = @{
+        Command          = [string]$cmd.Command
+        CommandParameters = ([string]$cmd.CommandParameters).Trim().Trim('"')
+        WorkingDirectory = ([string]$cmd.WorkingDirectory).TrimEnd('\')
+        SecurityLevel    = [string]$cmd.SecurityLevel
+    }
+    foreach ($field in $expected.Keys) {
+        if ($actual[$field] -ne $expected[$field]) {
+            throw "RansomwareCheck command action field $field is '$($actual[$field])', expected '$($expected[$field])'."
+        }
+    }
+}
+
+function Invoke-PythonInstaller {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$ArgumentList,
+
+        [string]$CommandName = 'Python installer'
+    )
+
+    # The python.org installer is a GUI exe: & would not wait and $LASTEXITCODE would be stale.
+    $p = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -Wait -PassThru
+    Assert-NativeCommandSucceeded -CommandName $CommandName -ExitCode $p.ExitCode
+}
 
 function Test-FsrmObjectIsMissing {
     param(
@@ -5914,8 +6027,7 @@ else {
             throw "SHA256 mismatch for $pythonInstallerName. Expected the official python.org SHA256 $pythonSha256 but Get-FileHash returned $actualHash. Aborting."
         }
 
-        & $pythonInstallerPath /quiet InstallAllUsers=1 PrependPath=1 Include_test=0
-        Assert-NativeCommandSucceeded -CommandName "Python $pythonVersion installer" -ExitCode $LASTEXITCODE
+        Invoke-PythonInstaller -FilePath $pythonInstallerPath -ArgumentList @('/quiet', 'InstallAllUsers=1', 'PrependPath=1', 'Include_test=0') -CommandName "Python $pythonVersion installer"
     } -Cleanup {
         Remove-PythonDownloadDirectory -Path $script:downloadDirectory
     }
