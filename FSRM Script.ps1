@@ -4551,16 +4551,16 @@ function Install-FSRMRansomware {
                                         }
                                         if ((Get-FsrmSetupAction -Exists ($null -ne $existingScreen)) -eq 'Create') {
                                             New-FsrmFileScreen -Path $screenPath -Template "RansomwareCheck" -Active
-                                        } elseif (-not (Test-RansomwareFileScreenIsExpected -Screen $existingScreen)) {
-                                            # A passive screen or another template would not block or run the deny script.
-                                            # Set-FsrmFileScreen has no -Template; Reset-FsrmFileScreen re-applies one.
+                                        } else {
+                                            # Always re-apply the template. A screen can already name
+                                            # RansomwareCheck, be active, and include Ransomware Files,
+                                            # and still run its own command instead of the deny script.
+                                            # Reset-FsrmFileScreen is idempotent. Set-FsrmFileScreen has no -Template.
                                             Reset-FsrmFileScreen -Path $screenPath -Template "RansomwareCheck" -Confirm:$false
                                             Set-FsrmFileScreen -Path $screenPath -Active -IncludeGroup @("Ransomware Files")
                                         }
                                         $finalScreen = Get-FsrmFileScreen -Path $screenPath -ErrorAction Stop
-                                        if (-not (Test-RansomwareFileScreenIsExpected -Screen $finalScreen)) {
-                                            throw "File screen $screenPath does not use the active RansomwareCheck template with the Ransomware Files group."
-                                        }
+                                        Assert-RansomwareFileScreen -Screen $finalScreen -Path $screenPath
 
                                      }
 
@@ -4572,14 +4572,113 @@ function Install-FSRMRansomware {
 # SMTPServer, EmailTo, and EmailFrom are required parameters.
 # Supply them when running this script. Example addresses are not embedded here.
 
+function Get-RansomwareCommandActionIssue {
+    param($Notifications)
+
+    $commands = @($Notifications | Where-Object { [string]$_.Type -eq 'Command' })
+    if ($commands.Count -ne 1) {
+        return "must have exactly one command action; found $($commands.Count)."
+    }
+    $cmd = $commands[0]
+    $expected = [ordered]@{
+        Command           = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
+        CommandParameters = 'C:\Scripts\ScriptToDenyPermissions.PS1'
+        WorkingDirectory  = 'C:\Windows\System32\WindowsPowerShell\v1.0'
+        SecurityLevel     = 'LocalSystem'
+    }
+    $actual = @{
+        Command           = [string]$cmd.Command
+        CommandParameters = ([string]$cmd.CommandParameters).Trim().Trim('"')
+        WorkingDirectory  = ([string]$cmd.WorkingDirectory).TrimEnd('\')
+        SecurityLevel     = [string]$cmd.SecurityLevel
+    }
+    foreach ($field in $expected.Keys) {
+        if ($actual[$field] -ne $expected[$field]) {
+            return "command action field $field is '$($actual[$field])', expected '$($expected[$field])'."
+        }
+    }
+    return $null
+}
+
+function Test-FsrmObjectHasProperty {
+    param(
+        $Object,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
+
+    if ($null -eq $Object) {
+        return $false
+    }
+    if (@($Object.PSObject.Properties.Name) -contains $Name) {
+        return $true
+    }
+    $cimPropertySet = $Object.PSObject.Properties['CimInstanceProperties']
+    if ($null -eq $cimPropertySet -or $null -eq $cimPropertySet.Value) {
+        return $false
+    }
+    return $null -ne $cimPropertySet.Value[$Name]
+}
+
+function Get-RansomwareFileScreenIssue {
+    param(
+        $Screen,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    if ($null -eq $Screen) {
+        return "File screen $Path is missing."
+    }
+    if ($Screen.Template -ne 'RansomwareCheck') {
+        return "File screen $Path template is '$($Screen.Template)', expected 'RansomwareCheck'."
+    }
+    if ($Screen.Active -ne $true) {
+        return "File screen $Path is not active."
+    }
+    $groups = @($Screen.IncludeGroup)
+    if (($groups.Count -ne 1) -or ($groups[0] -ne 'Ransomware Files')) {
+        return "File screen $Path does not block exactly the Ransomware Files group."
+    }
+    # Older FSRM builds omit MatchesTemplate. When the property exists, a screen
+    # that has drifted from RansomwareCheck must not be left in place.
+    if ((Test-FsrmObjectHasProperty -Object $Screen -Name 'MatchesTemplate') -and ($Screen.MatchesTemplate -ne $true)) {
+        return "File screen $Path does not match the RansomwareCheck template (MatchesTemplate is '$($Screen.MatchesTemplate)')."
+    }
+    $commandIssue = Get-RansomwareCommandActionIssue -Notifications $Screen.Notification
+    if ($commandIssue) {
+        return "File screen $Path $commandIssue"
+    }
+    return $null
+}
+
 function Test-RansomwareFileScreenIsExpected {
     param($Screen)
 
     if ($null -eq $Screen) {
         return $false
     }
-    $groups = @($Screen.IncludeGroup)
-    return [bool](($Screen.Template -eq 'RansomwareCheck') -and ($Screen.Active -eq $true) -and ($groups.Count -eq 1) -and ($groups[0] -eq 'Ransomware Files'))
+    $path = [string]$Screen.Path
+    if ([string]::IsNullOrWhiteSpace($path)) {
+        $path = 'file screen'
+    }
+    return [string]::IsNullOrEmpty((Get-RansomwareFileScreenIssue -Screen $Screen -Path $path))
+}
+
+function Assert-RansomwareFileScreen {
+    param(
+        $Screen,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $issue = Get-RansomwareFileScreenIssue -Screen $Screen -Path $Path
+    if ($issue) {
+        throw $issue
+    }
 }
 
 function Write-NewTemplateFile {
@@ -4646,27 +4745,12 @@ function Assert-RansomwareCheckTemplate {
     if ($template.Active -ne $true) {
         throw "RansomwareCheck template is not active."
     }
-    $commands = @($template.Notification | Where-Object { [string]$_.Type -eq 'Command' })
-    if ($commands.Count -ne 1) {
-        throw "RansomwareCheck template must have exactly one command action; found $($commands.Count)."
+    $commandIssue = Get-RansomwareCommandActionIssue -Notifications $template.Notification
+    if ($commandIssue -like 'must have exactly one command action*') {
+        throw "RansomwareCheck template $commandIssue"
     }
-    $cmd = $commands[0]
-    $expected = [ordered]@{
-        Command          = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
-        CommandParameters = 'C:\Scripts\ScriptToDenyPermissions.PS1'
-        WorkingDirectory = 'C:\Windows\System32\WindowsPowerShell\v1.0'
-        SecurityLevel    = 'LocalSystem'
-    }
-    $actual = @{
-        Command          = [string]$cmd.Command
-        CommandParameters = ([string]$cmd.CommandParameters).Trim().Trim('"')
-        WorkingDirectory = ([string]$cmd.WorkingDirectory).TrimEnd('\')
-        SecurityLevel    = [string]$cmd.SecurityLevel
-    }
-    foreach ($field in $expected.Keys) {
-        if ($actual[$field] -ne $expected[$field]) {
-            throw "RansomwareCheck command action field $field is '$($actual[$field])', expected '$($expected[$field])'."
-        }
+    if ($commandIssue) {
+        throw "RansomwareCheck $commandIssue"
     }
 }
 
@@ -4682,7 +4766,12 @@ function Invoke-PythonInstaller {
     )
 
     # The python.org installer is a GUI exe: & would not wait and $LASTEXITCODE would be stale.
+    # 0 is success. 3010 (ERROR_SUCCESS_REBOOT_REQUIRED) is also success: Windows must reboot.
     $p = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -Wait -PassThru
+    if ($p.ExitCode -eq 3010) {
+        Write-Warning "$CommandName completed with exit code 3010 (reboot required)." -WarningAction Continue
+        return
+    }
     Assert-NativeCommandSucceeded -CommandName $CommandName -ExitCode $p.ExitCode
 }
 

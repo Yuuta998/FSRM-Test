@@ -120,7 +120,53 @@ if ($ok1 -and $fsrmAvailable -and $screenDisk) {
   $code = Invoke-Fsrm
   $fs = Get-FsrmFileScreen -Path $sp; Write-Host "  after template=$($fs.Template) active=$($fs.Active) groups=$(@($fs.IncludeGroup) -join ',')"
   $results['6 passive/wrong screen fixed'] = ($code -eq 0 -and $fs.Template -eq 'RansomwareCheck' -and $fs.Active -eq $true -and (@($fs.IncludeGroup) -join ',') -eq 'Ransomware Files')
-} else { $results['6 passive/wrong screen fixed'] = $null; Write-Host "  skipped: no non-C fixed disk or earlier failure" }
+  if ($results['6 passive/wrong screen fixed']) {
+    $plantReady = $false
+    try {
+      $actions = @((Get-FsrmFileScreen -Path $sp).Notification | ForEach-Object { $_.Clone() })
+      if (@($actions | Where-Object { [string]$_.Type -eq 'Command' }).Count -lt 1) {
+        $actions = @((Get-FsrmFileScreenTemplate -Name 'RansomwareCheck').Notification | ForEach-Object { $_.Clone() })
+      }
+      $sawPlantedCommand = $false
+      foreach ($action in $actions) {
+        if ([string]$action.Type -eq 'Command') {
+          $action.Command = "$env:SystemRoot\System32\cmd.exe"
+          $action.CommandParameters = '/c echo planted'
+          $action.WorkingDirectory = "$env:SystemRoot\System32"
+          $sawPlantedCommand = $true
+        }
+      }
+      Set-FsrmFileScreen -Path $sp -Active -IncludeGroup 'Ransomware Files' -Notification $actions -ErrorAction Stop
+      $prePlant = Get-FsrmFileScreen -Path $sp
+      $preCmds = @($prePlant.Notification | Where-Object { [string]$_.Type -eq 'Command' })
+      $preCommand = if ($preCmds.Count -ge 1) { [string]$preCmds[0].Command } else { '' }
+      Write-Host "  planted template=$($prePlant.Template) active=$($prePlant.Active) groups=$(@($prePlant.IncludeGroup) -join ',') command=$preCommand"
+      $plantReady = $sawPlantedCommand -and ($prePlant.Template -eq 'RansomwareCheck') -and ($prePlant.Active -eq $true) -and ((@($prePlant.IncludeGroup) -join ',') -eq 'Ransomware Files') -and ($preCmds.Count -eq 1) -and ($preCommand -like '*\cmd.exe')
+    } catch {
+      Write-Host "  could not plant screen command: $($_.Exception.Message)"
+    }
+    New-Source -Text $src1
+    $codePlant = Invoke-Fsrm
+    $fsPlant = Get-FsrmFileScreen -Path $sp
+    $postCmds = @($fsPlant.Notification | Where-Object { [string]$_.Type -eq 'Command' })
+    $postCmd = if ($postCmds.Count -ge 1) { $postCmds[0] } else { $null }
+    $postCommand = [string]$postCmd.Command
+    $postArgs = ([string]$postCmd.CommandParameters).Trim().Trim('"')
+    $postWd = ([string]$postCmd.WorkingDirectory).TrimEnd('\')
+    $postLevel = [string]$postCmd.SecurityLevel
+    Write-Host "  cleared code=$codePlant command=$postCommand params=$postArgs wd=$postWd level=$postLevel matches=$($fsPlant.MatchesTemplate)"
+    $cleared = $plantReady -and ($codePlant -eq 0) -and ($postCmds.Count -eq 1) -and ($postCommand -eq 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe') -and ($postArgs -eq 'C:\Scripts\ScriptToDenyPermissions.PS1') -and ($postWd -eq 'C:\Windows\System32\WindowsPowerShell\v1.0') -and ($postLevel -eq 'LocalSystem') -and ($fsPlant.Template -eq 'RansomwareCheck') -and ($fsPlant.Active -eq $true) -and ((@($fsPlant.IncludeGroup) -join ',') -eq 'Ransomware Files')
+    if ($fsPlant.PSObject.Properties.Name -contains 'MatchesTemplate') { $cleared = $cleared -and ($fsPlant.MatchesTemplate -eq $true) }
+    $results['6 planted screen command cleared'] = [bool]$cleared
+  } else {
+    $results['6 planted screen command cleared'] = $null
+    Write-Host "  planted command check skipped"
+  }
+} else {
+  $results['6 passive/wrong screen fixed'] = $null
+  $results['6 planted screen command cleared'] = $null
+  Write-Host "  skipped: no non-C fixed disk or earlier failure"
+}
 
 Write-Host "=== Check 7: pre-existing ExcludePattern is cleared ==="
 if ($ok1 -and $fsrmAvailable) {
@@ -158,7 +204,17 @@ $threwOnFail = $false
 try { Invoke-PythonInstaller -FilePath "$env:SystemRoot\System32\cmd.exe" -ArgumentList @('/c','exit 1603') -CommandName 'fake installer' } catch { $threwOnFail = $true; Write-Host "  threw: $($_.Exception.Message)" }
 $okOnZero = $true
 try { Invoke-PythonInstaller -FilePath "$env:SystemRoot\System32\cmd.exe" -ArgumentList @('/c','exit 0') -CommandName 'fake installer' } catch { $okOnZero = $false; Write-Host "  unexpected throw: $($_.Exception.Message)" }
-$results['9 failed installer exit code throws'] = ($threwOnFail -and $okOnZero)
+$okOnReboot = $false
+$warnedOnReboot = $false
+try {
+  $rebootOutput = @(Invoke-PythonInstaller -FilePath "$env:SystemRoot\System32\cmd.exe" -ArgumentList @('/c','exit 3010') -CommandName 'fake installer' 3>&1)
+  $okOnReboot = $true
+  $warnedOnReboot = [bool]((@($rebootOutput) | ForEach-Object { "$_" }) -join "`n" -match 'reboot required')
+  Write-Host "  3010 output: $(@($rebootOutput) -join ' | ')"
+} catch {
+  Write-Host "  unexpected throw on 3010: $($_.Exception.Message)"
+}
+$results['9 failed installer exit code throws'] = ($threwOnFail -and $okOnZero -and $okOnReboot -and $warnedOnReboot)
 
 Write-Host "=== Bonus: python tests/test_email.py ==="
 $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + $env:Path
