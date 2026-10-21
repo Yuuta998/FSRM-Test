@@ -1,12 +1,25 @@
-codex/add-email-composition-test-with-unittest
+import os
 import smtplib
 import socket
 
 sender_address = ""  # Replace this with sender email address
 receiver_address = ""  # Replace this with any valid email address (this is the receiver address)
-account_password = ""  # Replace this with your account password
 
 subject = "Something?"  # You can put anything in for the Subject
+
+
+def require_smtp_password() -> str:
+    """Return the SMTP password from FSRM_SMTP_PASSWORD.
+
+    The password is not stored in this file. Fail clearly when it is unset.
+    """
+    password = os.environ.get("FSRM_SMTP_PASSWORD")
+    if password is None or not password.strip():
+        raise RuntimeError(
+            "FSRM_SMTP_PASSWORD is not set. Set this environment variable to the "
+            "SMTP account password before sending email."
+        )
+    return password
 
 
 def compose_message(hostname: str, subject_line: str = subject) -> str:
@@ -27,9 +40,10 @@ def compose_message(hostname: str, subject_line: str = subject) -> str:
 
 def send_email() -> None:
     """Send the composed message via Gmail SMTP."""
+    password = require_smtp_password()
     hostname = socket.gethostname()
     smtp_server = smtplib.SMTP_SSL("smtp.gmail.com", 465)
-    smtp_server.login(sender_address, account_password)
+    smtp_server.login(sender_address, password)
     message = compose_message(hostname)
     smtp_server.sendmail(sender_address, receiver_address, message)
     smtp_server.close()
@@ -37,36 +51,3 @@ def send_email() -> None:
 
 if __name__ == "__main__":
     send_email()
-import smtplib
-import socket
-
-sender_address = "" # Replace this with sender email address
- 
-receiver_address = "" # Replace this with any valid email address (this is the receiver address)
- 
-account_password = "" # Replace this with your account password
-
-# You can put anything in for the Subject
-
-subject = "Something?"
-hostname = socket.gethostname()
-
-body = "Server " + hostname + " has possibly been infected or being attacked by Ransomware" "\n\n""Check Event Logs for Event ID 8215. The user has been denied access to all file shares." "\n" "Once security threat has been resolved, run the following powershell command on the server " + hostname + " to unblock the user from file shares: get-smbshare | unblock-smbshareaccess -accountname $username -force"
- 
-# Endpoint for the SMTP Gmail server 
-# IF needing to change this get the SMTP of the server attempting to use and the port.
-
-smtp_server = smtplib.SMTP_SSL("smtp.gmail.com", 465)
- 
-# Login with your Gmail account using SMTP
-smtp_server.login(sender_address, account_password)
- 
-# Let's combine the subject and the body onto a single message
-message = f"Subject: {subject}\n\n{body}"
- 
-# We'll be sending this message in the above format (Subject:...\n\nBody)
-smtp_server.sendmail(sender_address, receiver_address, message)
- 
-# Close our endpoint
-smtp_server.close()
-main

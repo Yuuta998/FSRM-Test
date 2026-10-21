@@ -1,3 +1,32 @@
+<#
+.SYNOPSIS
+Configures an FSRM ransomware file screen and installs Python for alert email.
+.DESCRIPTION
+SMTPServer, EmailTo, and EmailFrom are required. This script does not embed example mail settings.
+.PARAMETER SMTPServer
+SMTP server used to send file-screen alert email.
+.PARAMETER EmailTo
+Address that receives file-screen alert email.
+.PARAMETER EmailFrom
+Address that file-screen alert email is sent from.
+#>
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true, HelpMessage = "SMTP server used to send file-screen alert email.")]
+    [ValidateNotNullOrEmpty()]
+    [string]$SMTPServer,
+
+    [Parameter(Mandatory = $true, HelpMessage = "Address that receives file-screen alert email.")]
+    [ValidateNotNullOrEmpty()]
+    [string]$EmailTo,
+
+    [Parameter(Mandatory = $true, HelpMessage = "Address that file-screen alert email is sent from.")]
+    [ValidateNotNullOrEmpty()]
+    [string]$EmailFrom
+)
+
+$ErrorActionPreference = 'Stop'
+
 function Install-FSRMRansomware {
     <#
     .SYNOPSIS
@@ -10,22 +39,22 @@ function Install-FSRMRansomware {
     .PARAMETER EmailFrom
     Specify the email address that the email alerts are sent from. 
     #>
-#Email information is at line 4492 currently. 
-#Parameters I do not know if they work.
+# SMTPServer, EmailTo, and EmailFrom are required script parameters.
+# Pass them on the command line. Do not hard-code example addresses.
 
         [CmdletBinding()]
         param(
-             [Parameter(Mandatory=$True,
-                        HelpMessage= "")]
-            [String]$SMTPServer,
-            [Parameter(Mandatory=$True,
-                       HelpMessage= "")]
-            [String]$EmailTo,
-            [Parameter(Mandatory=$True,
-                       HelpMessage= "")]
-            [String]$EmailFrom
-    
-    
+            [Parameter(Mandatory = $true, HelpMessage = "SMTP server used to send file-screen alert email.")]
+            [ValidateNotNullOrEmpty()]
+            [string]$SMTPServer,
+
+            [Parameter(Mandatory = $true, HelpMessage = "Address that receives file-screen alert email.")]
+            [ValidateNotNullOrEmpty()]
+            [string]$EmailTo,
+
+            [Parameter(Mandatory = $true, HelpMessage = "Address that file-screen alert email is sent from.")]
+            [ValidateNotNullOrEmpty()]
+            [string]$EmailFrom
         )
         
         Process{
@@ -45,7 +74,8 @@ function Install-FSRMRansomware {
     
                 #Create File Group for FSRM 
                 #To Update Extentions https://fsrm.experiant.ca/api/v1/get Current is 4347 Extentions
-                New-FsrmFileGroup -name "Ransomware Files" -IncludePattern @( 
+                # A previous run may already have created this group. Update it instead of failing.
+                $ransomwareIncludePattern = @( 
                             "*DECRYPT_INSTRUCTION.HTML*",
                             "*HELP_DECRYPT.HTML*", 
                             "*decrypt all files*.bmp*", 
@@ -4440,19 +4470,35 @@ function Install-FSRMRansomware {
                             "*.blocatto",
                             "*.8lock8",
                             "*.777")
-                            
+                $existingRansomwareGroup = $null
+                try {
+                    $existingRansomwareGroup = Get-FsrmFileGroup -Name "Ransomware Files" -ErrorAction Stop
+                } catch {
+                    if (-not (Test-FsrmObjectIsMissing -Message $_.Exception.Message -ErrorId $_.FullyQualifiedErrorId -Category ([string]$_.CategoryInfo.Category))) {
+                        throw
+                    }
+                }
+                if ((Get-FsrmSetupAction -Exists ($null -ne $existingRansomwareGroup)) -eq 'Create') {
+                    New-FsrmFileGroup -Name "Ransomware Files" -IncludePattern $ransomwareIncludePattern
+                } else {
+                    # Clear any ExcludePattern so an exclusion cannot hide ransomware extensions.
+                    Set-FsrmFileGroup -Name "Ransomware Files" -IncludePattern $ransomwareIncludePattern -ExcludePattern @()
+                }
 
-
+            # CurrentSid records who created the command action. Use the account running
+            # this setup instead of a SID copied from one host.
+            $templateCurrentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 
             #Create FSRM Template xml file and import template then remove xml file
             $FSRMTemplate = @"
-<?xml version="1.0" ?><Root ><Header DatabaseVersion = '2.0' ></Header><QuotaTemplates ></QuotaTemplates><DatascreenTemplates ><DatascreenTemplate Name = 'RansomwareCheck' Id = '{122F5AB4-9DF0-4F09-B89E-0F7BDC9D46CC}' Flags = '1' Description = '' ><BlockedGroups ><FileGroup FileGroupId = '{82D08F60-7319-4BE2-8621-066DB91A958E}' Name = 'Ransomware%sFiles' ></FileGroup></BlockedGroups><FileGroupActions ><Action Type="1" Id="{73AFB339-FF17-42DC-B9B9-E7C9A8E7C9A9}" EventType="2" MessageText="User%s[Source%sIo%sOwner]%sattempted%sto%ssave%s[Source%sFile%sPath]%sto%s[File%sScreen%sPath]%son%sthe%s[Server]%sserver.%sThis%sfile%sis%sin%sthe%s[Violated%sFile%sGroup]%sfile%sgroup,%swhich%sis%snot%spermitted%son%sthe%sserver." /><Action Type="3" Id="{D0B80CC5-E6DD-481C-9534-19944A851A72}" ExecutablePath="C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" Arguments="&quot;C:\Scripts\ScriptToDenyPermissions.PS1&quot;" WorkingDirectory="C:\Windows\System32\WindowsPowerShell\v1.0\" Account="3" MonitorCommand="0" KillTimeOut="0" LogResult="1" CurrentSid="S-1-5-21-3468280891-3112941812-1175424509-500" /></FileGroupActions></DatascreenTemplate></DatascreenTemplates><FileGroups ></FileGroups></Root>
+<?xml version="1.0" ?><Root ><Header DatabaseVersion = '2.0' ></Header><QuotaTemplates ></QuotaTemplates><DatascreenTemplates ><DatascreenTemplate Name = 'RansomwareCheck' Id = '{122F5AB4-9DF0-4F09-B89E-0F7BDC9D46CC}' Flags = '1' Description = '' ><BlockedGroups ><FileGroup FileGroupId = '{82D08F60-7319-4BE2-8621-066DB91A958E}' Name = 'Ransomware%sFiles' ></FileGroup></BlockedGroups><FileGroupActions ><Action Type="1" Id="{73AFB339-FF17-42DC-B9B9-E7C9A8E7C9A9}" EventType="2" MessageText="User%s[Source%sIo%sOwner]%sattempted%sto%ssave%s[Source%sFile%sPath]%sto%s[File%sScreen%sPath]%son%sthe%s[Server]%sserver.%sThis%sfile%sis%sin%sthe%s[Violated%sFile%sGroup]%sfile%sgroup,%swhich%sis%snot%spermitted%son%sthe%sserver." /><Action Type="3" Id="{D0B80CC5-E6DD-481C-9534-19944A851A72}" ExecutablePath="C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" Arguments="&quot;C:\Scripts\ScriptToDenyPermissions.PS1&quot;" WorkingDirectory="C:\Windows\System32\WindowsPowerShell\v1.0\" Account="3" MonitorCommand="0" KillTimeOut="0" LogResult="1" CurrentSid="$templateCurrentSid" /></FileGroupActions></DatascreenTemplate></DatascreenTemplates><FileGroups ></FileGroups></Root>
 "@
-            $FSRMTemplate | Out-File -FilePath C:\users\public\FSRMTemplate.xml 
-
-            Filescrn template import /file:C:\users\public\FSRMTemplate.xml 
-
-            Remove-Item -path C:\Users\Public\FSRMTemplate.xml 
+            # The template's command runs as SYSTEM. Always re-import it with /overwrite so a
+            # tampered existing template is replaced, then verify the result.
+            # The XML goes into the Administrators/SYSTEM-only C:\scripts, never C:\Users\Public.
+            Initialize-ProtectedScriptsDirectory
+            Import-RansomwareCheckTemplate -TemplateXml $FSRMTemplate -Directory 'C:\scripts'
+            Assert-RansomwareCheckTemplate
 
 
             #Creates Script Block to perform email message and block SMB Permissions. Exports script block to a PS1 for the File Screen Template.
@@ -4479,18 +4525,42 @@ function Install-FSRMRansomware {
                          
 "@
 
-            #Creates file path to store block smb script that is called by the FSRM template
-            New-Item -Path "C:\scripts" -Force -Type directory
-            $DenyPermissionsScript | Out-File -FilePath "C:\scripts\ScriptToDenyPermissions.PS1"
+            # FSRM runs this script elevated. The directory must not inherit write
+            # access from C:\, and an existing user-owned folder is refused.
+            Initialize-ProtectedScriptsDirectory
+            # Python imports from this directory first, so a leftover file must not
+            # be opened in place. Replace the deny script only after every child is safe.
+            $denyScriptPath = 'C:\scripts\ScriptToDenyPermissions.PS1'
+            Write-NewScriptFile -Path $denyScriptPath -Content $DenyPermissionsScript
             #unwblocks the script to allo for execution 
-            Unblock-file "C:\scripts\ScriptToDenyPermissions.PS1"
+            Unblock-file -LiteralPath $denyScriptPath
+            Set-ProtectedFileAcl -Path $denyScriptPath
 
             #find all drives that are not the C drive and create file screen for those drives. Essentially all drives except the C drive will be monitored for crypto locker files.
             $disks = GET-WMIOBJECT win32_logicaldisk -filter "DriveType='3'" | Where-Object {$_.deviceid -ne "C:"}
             ForEach($disk in $disks) {
                                         $DRIVE = $DISK.DeviceID
-
-                                        New-FSRMFILEScreen -path "$DRIVE\" -template "RansomwareCheck"
+                                        $screenPath = "$DRIVE\"
+                                        $existingScreen = $null
+                                        try {
+                                            $existingScreen = Get-FsrmFileScreen -Path $screenPath -ErrorAction Stop
+                                        } catch {
+                                            if (-not (Test-FsrmObjectIsMissing -Message $_.Exception.Message -ErrorId $_.FullyQualifiedErrorId -Category ([string]$_.CategoryInfo.Category))) {
+                                                throw
+                                            }
+                                        }
+                                        if ((Get-FsrmSetupAction -Exists ($null -ne $existingScreen)) -eq 'Create') {
+                                            New-FsrmFileScreen -Path $screenPath -Template "RansomwareCheck" -Active
+                                        } else {
+                                            # Always re-apply the template. A screen can already name
+                                            # RansomwareCheck, be active, and include Ransomware Files,
+                                            # and still run its own command instead of the deny script.
+                                            # Reset-FsrmFileScreen is idempotent. Set-FsrmFileScreen has no -Template.
+                                            Reset-FsrmFileScreen -Path $screenPath -Template "RansomwareCheck" -Confirm:$false
+                                            Set-FsrmFileScreen -Path $screenPath -Active -IncludeGroup @("Ransomware Files")
+                                        }
+                                        $finalScreen = Get-FsrmFileScreen -Path $screenPath -ErrorAction Stop
+                                        Assert-RansomwareFileScreen -Screen $finalScreen -Path $screenPath
 
                                      }
 
@@ -4499,25 +4569,1563 @@ function Install-FSRMRansomware {
         }
    
 }
-# EmailTo can be changed to the email that will receive the email.
-# EmailFrom is the from address 
-# SMTPServer can be changed to the email server that your email account will use.
-# At this point the emailing part does not work to my knowledge.
-Install-FSRMRansomware -SMTPServer "smtp.office365.com" -EmailTo "EmailTo@email.com" -EmailFrom "EmailFrom@email.com"
-# Installing Python for Emailing add the Trusted switch
-$url = "https://www.python.org/ftp/python/3.7.6/python-3.7.6-amd64.exe"
-$output = "C:/tmp/python-3.7.6-amd64.exe"
+# SMTPServer, EmailTo, and EmailFrom are required parameters.
+# Supply them when running this script. Example addresses are not embedded here.
 
-if (Test-Path $output) {
-    Write-Host "Script exists - skipping installation"
-    return;
+function Get-RansomwareCommandActionIssue {
+    param($Notifications)
+
+    $commands = @($Notifications | Where-Object { [string]$_.Type -eq 'Command' })
+    if ($commands.Count -ne 1) {
+        return "must have exactly one command action; found $($commands.Count)."
+    }
+    $cmd = $commands[0]
+    $expected = [ordered]@{
+        Command           = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
+        CommandParameters = 'C:\Scripts\ScriptToDenyPermissions.PS1'
+        WorkingDirectory  = 'C:\Windows\System32\WindowsPowerShell\v1.0'
+        SecurityLevel     = 'LocalSystem'
+    }
+    $actual = @{
+        Command           = [string]$cmd.Command
+        CommandParameters = ([string]$cmd.CommandParameters).Trim().Trim('"')
+        WorkingDirectory  = ([string]$cmd.WorkingDirectory).TrimEnd('\')
+        SecurityLevel     = [string]$cmd.SecurityLevel
+    }
+    foreach ($field in $expected.Keys) {
+        if ($actual[$field] -ne $expected[$field]) {
+            return "command action field $field is '$($actual[$field])', expected '$($expected[$field])'."
         }
-New-Item -ItemType Directory -Force -Path C:/tmp
+    }
+    return $null
+}
 
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-Invoke-WebRequest -Uri $url -OutFile $output
+function Test-FsrmObjectHasProperty {
+    param(
+        $Object,
 
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
 
-& $output /quiet InstallAllUsers=1 PrependPath=1 Include_test=0 
+    if ($null -eq $Object) {
+        return $false
+    }
+    if (@($Object.PSObject.Properties.Name) -contains $Name) {
+        return $true
+    }
+    $cimPropertySet = $Object.PSObject.Properties['CimInstanceProperties']
+    if ($null -eq $cimPropertySet -or $null -eq $cimPropertySet.Value) {
+        return $false
+    }
+    return $null -ne $cimPropertySet.Value[$Name]
+}
+
+function Get-RansomwareFileScreenIssue {
+    param(
+        $Screen,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    if ($null -eq $Screen) {
+        return "File screen $Path is missing."
+    }
+    if ($Screen.Template -ne 'RansomwareCheck') {
+        return "File screen $Path template is '$($Screen.Template)', expected 'RansomwareCheck'."
+    }
+    if ($Screen.Active -ne $true) {
+        return "File screen $Path is not active."
+    }
+    $groups = @($Screen.IncludeGroup)
+    if (($groups.Count -ne 1) -or ($groups[0] -ne 'Ransomware Files')) {
+        return "File screen $Path does not block exactly the Ransomware Files group."
+    }
+    # Older FSRM builds omit MatchesTemplate. When the property exists, a screen
+    # that has drifted from RansomwareCheck must not be left in place.
+    if ((Test-FsrmObjectHasProperty -Object $Screen -Name 'MatchesTemplate') -and ($Screen.MatchesTemplate -ne $true)) {
+        return "File screen $Path does not match the RansomwareCheck template (MatchesTemplate is '$($Screen.MatchesTemplate)')."
+    }
+    $commandIssue = Get-RansomwareCommandActionIssue -Notifications $Screen.Notification
+    if ($commandIssue) {
+        return "File screen $Path $commandIssue"
+    }
+    return $null
+}
+
+function Test-RansomwareFileScreenIsExpected {
+    param($Screen)
+
+    if ($null -eq $Screen) {
+        return $false
+    }
+    $path = [string]$Screen.Path
+    if ([string]::IsNullOrWhiteSpace($path)) {
+        $path = 'file screen'
+    }
+    return [string]::IsNullOrEmpty((Get-RansomwareFileScreenIssue -Screen $Screen -Path $path))
+}
+
+function Assert-RansomwareFileScreen {
+    param(
+        $Screen,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $issue = Get-RansomwareFileScreenIssue -Screen $Screen -Path $Path
+    if ($issue) {
+        throw $issue
+    }
+}
+
+function Write-NewTemplateFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Content
+    )
+
+    # CreateNew fails if anything already has this name, so a planted file is never reused.
+    $stream = [System.IO.File]::Open(
+        $Path,
+        [System.IO.FileMode]::CreateNew,
+        [System.IO.FileAccess]::Write,
+        [System.IO.FileShare]::None)
+    try {
+        # filescrn.exe rejects a UTF-8 template. Write UTF-16LE with a BOM.
+        $encoding = [System.Text.UnicodeEncoding]::new($false, $true)
+        $preamble = $encoding.GetPreamble()
+        $bytes = $encoding.GetBytes($Content)
+        $stream.Write($preamble, 0, $preamble.Length)
+        $stream.Write($bytes, 0, $bytes.Length)
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
+function Import-RansomwareCheckTemplate {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TemplateXml,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Directory
+    )
+
+    Assert-ProtectedDirectoryAcl -Path $Directory
+    $templatePath = Join-Path $Directory ('FSRMTemplate-' + [guid]::NewGuid().ToString('n') + '.xml')
+    Assert-ChildPathInsideDirectory -Directory $Directory -ChildPath $templatePath
+    $created = $false
+    try {
+        Write-NewTemplateFile -Path $templatePath -Content $TemplateXml
+        $created = $true
+        Set-ProtectedFileAcl -Path $templatePath
+        & filescrn.exe template import "/file:$templatePath" /template:RansomwareCheck /overwrite
+        Assert-NativeCommandSucceeded -CommandName "filescrn template import" -ExitCode $LASTEXITCODE
+    }
+    finally {
+        if ($created) {
+            Remove-Item -LiteralPath $templatePath -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Assert-RansomwareCheckTemplate {
+    $template = Get-FsrmFileScreenTemplate -Name 'RansomwareCheck' -ErrorAction Stop
+    $groups = @($template.IncludeGroup)
+    if (($groups.Count -ne 1) -or ($groups[0] -ne 'Ransomware Files')) {
+        throw "RansomwareCheck template does not block exactly the Ransomware Files group."
+    }
+    if ($template.Active -ne $true) {
+        throw "RansomwareCheck template is not active."
+    }
+    $commandIssue = Get-RansomwareCommandActionIssue -Notifications $template.Notification
+    if ($commandIssue -like 'must have exactly one command action*') {
+        throw "RansomwareCheck template $commandIssue"
+    }
+    if ($commandIssue) {
+        throw "RansomwareCheck $commandIssue"
+    }
+}
+
+function Invoke-PythonInstaller {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$ArgumentList,
+
+        [string]$CommandName = 'Python installer'
+    )
+
+    # The python.org installer is a GUI exe: & would not wait and $LASTEXITCODE would be stale.
+    # 0 is success. 3010 (ERROR_SUCCESS_REBOOT_REQUIRED) is also success: Windows must reboot.
+    $p = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -Wait -PassThru
+    if ($p.ExitCode -eq 3010) {
+        Write-Warning "$CommandName completed with exit code 3010 (reboot required)." -WarningAction Continue
+        return
+    }
+    Assert-NativeCommandSucceeded -CommandName $CommandName -ExitCode $p.ExitCode
+}
+
+function Test-FsrmObjectIsMissing {
+    param(
+        [string]$Message,
+        [string]$ErrorId,
+        [string]$Category
+    )
+
+    $text = "$Message $ErrorId $Category"
+    return [bool]($text -match '80045301|NotFound|not found|cannot find|does not exist|ObjectNotFound|objects found')
+}
+
+function Get-FsrmSetupAction {
+    param(
+        [Parameter(Mandatory = $true)]
+        [bool]$Exists
+    )
+
+    if ($Exists) {
+        return 'Reuse'
+    }
+    return 'Create'
+}
+
+function Assert-NativeCommandSucceeded {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$CommandName,
+
+        $ExitCode
+    )
+
+    if (($ExitCode -isnot [int]) -or ($ExitCode -ne 0)) {
+        throw "$CommandName failed with exit code $ExitCode."
+    }
+}
+
+function Assert-PythonInstallerSha256 {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$Sha256
+    )
+
+    if ($Sha256 -notmatch '^[0-9A-Fa-f]{64}$') {
+        throw "The Python installer SHA256 must be exactly 64 hexadecimal characters."
+    }
+}
+
+function Assert-DownloadDirectoryIsSafe {
+    param(
+        [Parameter(Mandatory = $true)]
+        [bool]$IsReparsePoint,
+
+        [string]$OwnerSid
+    )
+
+    if ($IsReparsePoint) {
+        throw "Refusing the Python download directory because it is a reparse point (junction or symlink)."
+    }
+
+    if ($OwnerSid -ne 'S-1-5-32-544') {
+        throw "Refusing the Python download directory because it is not owned by Administrators (S-1-5-32-544)."
+    }
+}
+
+function Assert-ExistingDownloadDirectory {
+    param(
+        [Parameter(Mandatory = $true)]
+        [bool]$Exists,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$IsReparsePoint,
+
+        [string]$OwnerSid
+    )
+
+    if (-not $Exists) {
+        return
+    }
+
+    Assert-DownloadDirectoryIsSafe -IsReparsePoint $IsReparsePoint -OwnerSid $OwnerSid
+    throw "Refusing the Python download directory because it already exists."
+}
+
+function Get-ScriptsDirectoryAction {
+    param(
+        [Parameter(Mandatory = $true)]
+        [bool]$Exists,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$IsReparsePoint,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$IsDirectory,
+
+        [string]$OwnerSid
+    )
+
+    if (-not $Exists) {
+        return 'Create'
+    }
+
+    if ($IsReparsePoint) {
+        throw "Refusing C:\scripts because it is a reparse point (junction or symlink)."
+    }
+
+    if (-not $IsDirectory) {
+        throw "Refusing C:\scripts because it is not a directory."
+    }
+
+    if ($OwnerSid -ne 'S-1-5-32-544') {
+        throw "Refusing C:\scripts because it is not owned by Administrators (S-1-5-32-544)."
+    }
+
+    return 'ResetDacl'
+}
+
+function Assert-ProtectedAclFacts {
+    param(
+        [Parameter(Mandatory = $true)]
+        [bool]$IsReparsePoint,
+
+        [string]$OwnerSid,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$InheritanceDisabled,
+
+        [string[]]$AllowSids
+    )
+
+    if ($IsReparsePoint) {
+        throw "Refusing the path because it is a reparse point (junction or symlink)."
+    }
+
+    if ($OwnerSid -ne 'S-1-5-32-544') {
+        throw "Refusing the path because it is not owned by Administrators (S-1-5-32-544)."
+    }
+
+    if (-not $InheritanceDisabled) {
+        throw "Refusing the path because ACL inheritance is enabled."
+    }
+
+    $expected = @('S-1-5-18', 'S-1-5-32-544')
+    $actual = @($AllowSids | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
+    if ($actual.Count -ne $expected.Count) {
+        throw "Refusing the path because its ACL is not limited to Administrators and SYSTEM."
+    }
+
+    foreach ($sid in $expected) {
+        if ($actual -notcontains $sid) {
+            throw "Refusing the path because its ACL is not limited to Administrators and SYSTEM."
+        }
+    }
+}
+
+function Assert-ChildPathInsideDirectory {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Directory,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ChildPath
+    )
+
+    $directoryFull = [System.IO.Path]::GetFullPath($Directory)
+    $childFull = [System.IO.Path]::GetFullPath($ChildPath)
+    $prefix = $directoryFull.TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
+    if (-not $childFull.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "The Python installer path is outside the download directory."
+    }
+}
+
+function Get-DownloadDirectoryFacts {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $isReparsePoint = $false
+    $isDirectory = $false
+    try {
+        $attributes = [System.IO.File]::GetAttributes($Path)
+        $isReparsePoint = (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)
+        $isDirectory = (($attributes -band [System.IO.FileAttributes]::Directory) -ne 0)
+    }
+    catch {
+        $inner = $_.Exception
+        while ($null -ne $inner.InnerException) {
+            $inner = $inner.InnerException
+        }
+        if ($inner -is [System.IO.FileNotFoundException] -or $inner -is [System.IO.DirectoryNotFoundException]) {
+            return [pscustomobject]@{
+                Exists         = $false
+                IsReparsePoint = $false
+                IsDirectory    = $false
+                OwnerSid       = $null
+            }
+        }
+        throw
+    }
+
+    $ownerSid = $null
+    if (-not $isReparsePoint -and $env:OS -eq 'Windows_NT') {
+        $acl = Get-Acl -LiteralPath $Path
+        $ownerSid = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+    }
+
+    return [pscustomobject]@{
+        Exists         = $true
+        IsReparsePoint = $isReparsePoint
+        IsDirectory    = $isDirectory
+        OwnerSid       = $ownerSid
+    }
+}
+
+function Initialize-FileSecurityTypes {
+    if ($env:OS -ne 'Windows_NT') {
+        throw "Protected ACLs require Windows."
+    }
+
+    if (-not ('System.Security.AccessControl.DirectorySecurity' -as [type])) {
+        Add-Type -AssemblyName System.IO.FileSystem.AccessControl -ErrorAction Stop
+    }
+}
+
+function Add-ProtectedAccessRules {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Security,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$InheritToChildren
+    )
+
+    $administratorsSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+    $systemSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+    $rights = [System.Security.AccessControl.FileSystemRights]::FullControl
+    $allow = [System.Security.AccessControl.AccessControlType]::Allow
+    foreach ($sid in @($administratorsSid, $systemSid)) {
+        if ($InheritToChildren) {
+            $inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+            $propagation = [System.Security.AccessControl.PropagationFlags]::None
+            $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+                $sid, $rights, $inheritance, $propagation, $allow)
+        }
+        else {
+            $rule = [System.Security.AccessControl.FileSystemAccessRule]::new($sid, $rights, $allow)
+        }
+        [void]$Security.AddAccessRule($rule)
+    }
+}
+
+function New-ProtectedDirectorySecurity {
+    $administratorsSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+    $security = [System.Security.AccessControl.DirectorySecurity]::new()
+    $security.SetOwner($administratorsSid)
+    $security.SetAccessRuleProtection($true, $false)
+    Add-ProtectedAccessRules -Security $security -InheritToChildren $true
+    return $security
+}
+
+function Set-ProtectedSecurityDescriptor {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$InheritToChildren
+    )
+
+    $administratorsSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+    $acl = Get-Acl -LiteralPath $Path
+    $acl.SetOwner($administratorsSid)
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($rule in @($acl.Access)) {
+        [void]$acl.RemoveAccessRule($rule)
+    }
+    Add-ProtectedAccessRules -Security $acl -InheritToChildren $InheritToChildren
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+function New-DirectoryWithProtectedAcl {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    Initialize-FileSecurityTypes
+    $security = New-ProtectedDirectorySecurity
+    if ($PSVersionTable.PSVersion.Major -ge 7) {
+        if (-not ('System.IO.FileSystemAclExtensions' -as [type])) {
+            Add-Type -AssemblyName System.IO.FileSystem.AccessControl -ErrorAction Stop
+        }
+        [void][System.IO.FileSystemAclExtensions]::CreateDirectory($security, $Path)
+    }
+    else {
+        [void][System.IO.Directory]::CreateDirectory($Path, $security)
+    }
+}
+
+function Get-ExplicitAllowSids {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $acl = Get-Acl -LiteralPath $Path
+    $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+    $allowSids = foreach ($rule in $rules) {
+        if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) {
+            throw "Refusing '$Path' because its ACL contains a deny entry."
+        }
+        $rule.IdentityReference.Value
+    }
+    return [pscustomobject]@{
+        InheritanceDisabled = [bool]$acl.AreAccessRulesProtected
+        AllowSids           = @($allowSids)
+    }
+}
+
+function Assert-ProtectedDirectoryAcl {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $facts = Get-DownloadDirectoryFacts -Path $Path
+    $aclFacts = Get-ExplicitAllowSids -Path $Path
+    Assert-ProtectedAclFacts -IsReparsePoint $facts.IsReparsePoint -OwnerSid $facts.OwnerSid -InheritanceDisabled $aclFacts.InheritanceDisabled -AllowSids $aclFacts.AllowSids
+}
+
+function Set-ProtectedFileAcl {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    Initialize-FileSecurityTypes
+    $facts = Get-DownloadDirectoryFacts -Path $Path
+    if (-not $facts.Exists) {
+        throw "Cannot protect a missing file: $Path"
+    }
+    if ($facts.IsReparsePoint) {
+        throw "Refusing to protect a reparse point: $Path"
+    }
+
+    # A same-volume move keeps the source owner and DACL, so replace both.
+    Set-ProtectedSecurityDescriptor -Path $Path -InheritToChildren $false
+
+    $updated = Get-DownloadDirectoryFacts -Path $Path
+    $aclFacts = Get-ExplicitAllowSids -Path $Path
+    Assert-ProtectedAclFacts -IsReparsePoint $updated.IsReparsePoint -OwnerSid $updated.OwnerSid -InheritanceDisabled $aclFacts.InheritanceDisabled -AllowSids $aclFacts.AllowSids
+}
+
+function Assert-ScriptsChildIsSafe {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$IsReparsePoint,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$IsDirectory,
+
+        $LinkCount,
+
+        [string]$OwnerSid,
+
+        [string[]]$AceSids,
+
+        [bool]$HasDenyAce
+    )
+
+    $allowedNames = @('Email.py', 'ScriptToDenyPermissions.PS1')
+    $nameAllowed = $false
+    foreach ($candidate in $allowedNames) {
+        if ([string]::Equals($Name, $candidate, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $nameAllowed = $true
+            break
+        }
+    }
+    if (-not $nameAllowed) {
+        throw "Refusing C:\scripts because '$Name' is not one of the allowed files (Email.py, ScriptToDenyPermissions.PS1). Remove it, then run this script again."
+    }
+
+    if ($IsReparsePoint) {
+        throw "Refusing C:\scripts because '$Name' is a reparse point (junction or symlink). Remove it, then run this script again."
+    }
+
+    if ($IsDirectory) {
+        throw "Refusing C:\scripts because '$Name' is a subfolder. Remove it, then run this script again."
+    }
+
+    # Fail closed unless the link count is an integer equal to 1.
+    if (($LinkCount -isnot [int]) -or ($LinkCount -ne 1)) {
+        throw "Refusing C:\scripts because the link count for '$Name' is not 1. Remove extra hard links, then run this script again."
+    }
+
+    if ($OwnerSid -ne 'S-1-5-32-544' -and $OwnerSid -ne 'S-1-5-18') {
+        throw "Refusing C:\scripts because '$Name' is not owned by Administrators or SYSTEM. Remove it, then run this script again."
+    }
+
+    if ($HasDenyAce) {
+        throw "Refusing C:\scripts because '$Name' has a deny ACE. Remove it, then run this script again."
+    }
+
+    $protectedSids = @('S-1-5-32-544', 'S-1-5-18')
+    foreach ($sid in @($AceSids)) {
+        if ([string]::IsNullOrWhiteSpace($sid) -or ($protectedSids -notcontains $sid)) {
+            throw "Refusing C:\scripts because '$Name' has an ACE for '$sid', outside the Administrators and SYSTEM set. Remove it, then run this script again."
+        }
+    }
+}
+
+function Get-DirectoryChildPathsWithoutFollowing {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    # Names only. This does not recurse through a child junction or symlink.
+    return @([System.IO.Directory]::EnumerateFileSystemEntries($Path))
+}
+
+function Initialize-FileHandleNative {
+    if ('FsrmScriptFileHandle' -as [type]) {
+        return
+    }
+
+    $typeDefinition = @'
+using System;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using System.Security.Principal;
+using Microsoft.Win32.SafeHandles;
+
+public sealed class FsrmFileHandleFacts {
+    public int LinkCount { get; set; }
+    public bool IsReparsePoint { get; set; }
+    public bool IsDirectory { get; set; }
+}
+
+public sealed class FsrmTrustedFile {
+    public int LinkCount { get; set; }
+    public bool LinkCountFits { get; set; }
+    public bool IsReparsePoint { get; set; }
+    public bool IsDirectory { get; set; }
+    public bool HasDacl { get; set; }
+    public bool HasDenyAce { get; set; }
+    public bool HasUnexpectedAce { get; set; }
+    public string OwnerSid { get; set; }
+    public string[] AceSids { get; set; }
+    public byte[] Bytes { get; set; }
+}
+
+public static class FsrmScriptFileHandle {
+    private const uint FILE_READ_ATTRIBUTES = 0x0080;
+    private const uint FILE_SHARE_READ = 0x00000001;
+    private const uint FILE_SHARE_WRITE = 0x00000002;
+    private const uint FILE_SHARE_DELETE = 0x00000004;
+    private const uint OPEN_EXISTING = 3;
+    private const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
+    private const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
+    private const uint FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400;
+    private const uint FILE_ATTRIBUTE_DIRECTORY = 0x00000010;
+    private const uint READ_CONTROL = 0x00020000;
+    private const uint WRITE_DAC = 0x00040000;
+    private const uint WRITE_OWNER = 0x00080000;
+    private const uint OWNER_SECURITY_INFORMATION = 0x00000001;
+    private const uint DACL_SECURITY_INFORMATION = 0x00000004;
+    private const uint PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000;
+    private const uint SE_FILE_OBJECT = 1;
+    private const int FILE_FULL_CONTROL = 0x1F01FF;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ByHandleFileInformation {
+        public uint FileAttributes;
+        public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastAccessTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastWriteTime;
+        public uint VolumeSerialNumber;
+        public uint FileSizeHigh;
+        public uint FileSizeLow;
+        public uint NumberOfLinks;
+        public uint FileIndexHigh;
+        public uint FileIndexLow;
+    }
+
+    [DllImport("kernel32.dll", EntryPoint = "CreateFileW", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern SafeFileHandle CreateFile(
+        string lpFileName,
+        uint dwDesiredAccess,
+        uint dwShareMode,
+        IntPtr lpSecurityAttributes,
+        uint dwCreationDisposition,
+        uint dwFlagsAndAttributes,
+        IntPtr hTemplateFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetFileInformationByHandle(
+        SafeFileHandle hFile,
+        out ByHandleFileInformation lpFileInformation);
+
+    [DllImport("kernel32.dll", EntryPoint = "DeleteFileW", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool DeleteFile(string lpFileName);
+
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern uint SetSecurityInfo(
+        SafeFileHandle handle,
+        uint objectType,
+        uint securityInfo,
+        IntPtr owner,
+        IntPtr group,
+        IntPtr dacl,
+        IntPtr sacl);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern uint GetSecurityInfo(
+        SafeFileHandle handle,
+        uint objectType,
+        uint securityInfo,
+        out IntPtr owner,
+        out IntPtr group,
+        out IntPtr dacl,
+        out IntPtr sacl,
+        out IntPtr securityDescriptor);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool GetAclInformation(
+        IntPtr acl,
+        ref AclSizeInformation information,
+        uint length,
+        int informationClass);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool GetAce(IntPtr acl, int index, out IntPtr ace);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr LocalFree(IntPtr handle);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool ReadFile(
+        SafeFileHandle handle,
+        byte[] buffer,
+        int bytesToRead,
+        out int bytesRead,
+        IntPtr overlapped);
+
+    private const uint FILE_READ_DATA = 0x0001;
+    private const int ACL_SIZE_INFORMATION_CLASS = 2;
+    private const byte ACCESS_ALLOWED_ACE_TYPE = 0;
+    private const byte ACCESS_DENIED_ACE_TYPE = 1;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct AclSizeInformation {
+        public uint AceCount;
+        public uint AclBytesInUse;
+        public uint AclBytesFree;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct AceHeader {
+        public byte AceType;
+        public byte AceFlags;
+        public ushort AceSize;
+    }
+
+    public static FsrmFileHandleFacts Read(string path) {
+        SafeFileHandle handle = CreateFile(
+            path,
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            IntPtr.Zero,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            IntPtr.Zero);
+        if (handle == null || handle.IsInvalid) {
+            int error = Marshal.GetLastWin32Error();
+            if (handle != null) {
+                handle.Dispose();
+            }
+            if (error == 2 || error == 3) {
+                throw new FileNotFoundException("The file was not found.", path);
+            }
+            throw new Win32Exception(error);
+        }
+
+        try {
+            ByHandleFileInformation info;
+            if (!GetFileInformationByHandle(handle, out info)) {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+            if (info.NumberOfLinks > int.MaxValue) {
+                throw new InvalidOperationException("The link count does not fit in a 32-bit integer.");
+            }
+
+            FsrmFileHandleFacts facts = new FsrmFileHandleFacts();
+            facts.LinkCount = (int)info.NumberOfLinks;
+            facts.IsReparsePoint = (info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+            facts.IsDirectory = (info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            return facts;
+        }
+        finally {
+            handle.Dispose();
+        }
+    }
+
+    public static void Delete(string path) {
+        if (!DeleteFile(path)) {
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        }
+    }
+
+    public static void ProtectDirectory(string path) {
+        SafeFileHandle handle = CreateFile(
+            path,
+            READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            IntPtr.Zero,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            IntPtr.Zero);
+        if (handle == null || handle.IsInvalid) {
+            int error = Marshal.GetLastWin32Error();
+            if (handle != null) {
+                handle.Dispose();
+            }
+            throw new Win32Exception(error);
+        }
+
+        try {
+            ByHandleFileInformation info;
+            if (!GetFileInformationByHandle(handle, out info)) {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+            if ((info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+                throw new InvalidOperationException("Refusing C:\\scripts because it is a reparse point (junction or symlink).");
+            }
+
+            SecurityIdentifier administrators = new SecurityIdentifier("S-1-5-32-544");
+            SecurityIdentifier system = new SecurityIdentifier("S-1-5-18");
+            RawAcl acl = new RawAcl(GenericAcl.AclRevision, 2);
+            AceFlags inherit = AceFlags.ContainerInherit | AceFlags.ObjectInherit;
+            acl.InsertAce(acl.Count, new CommonAce(inherit, AceQualifier.AccessAllowed, FILE_FULL_CONTROL, administrators, false, null));
+            acl.InsertAce(acl.Count, new CommonAce(inherit, AceQualifier.AccessAllowed, FILE_FULL_CONTROL, system, false, null));
+
+            byte[] ownerBytes = new byte[administrators.BinaryLength];
+            administrators.GetBinaryForm(ownerBytes, 0);
+            byte[] daclBytes = new byte[acl.BinaryLength];
+            acl.GetBinaryForm(daclBytes, 0);
+            GCHandle ownerHandle = GCHandle.Alloc(ownerBytes, GCHandleType.Pinned);
+            GCHandle daclHandle = GCHandle.Alloc(daclBytes, GCHandleType.Pinned);
+            try {
+                uint result = SetSecurityInfo(
+                    handle,
+                    SE_FILE_OBJECT,
+                    OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    ownerHandle.AddrOfPinnedObject(),
+                    IntPtr.Zero,
+                    daclHandle.AddrOfPinnedObject(),
+                    IntPtr.Zero);
+                if (result != 0) {
+                    throw new Win32Exception((int)result);
+                }
+            }
+            finally {
+                ownerHandle.Free();
+                daclHandle.Free();
+            }
+        }
+        finally {
+            handle.Dispose();
+        }
+    }
+
+    public static FsrmTrustedFile ReadTrusted(string path) {
+        SafeFileHandle handle = CreateFile(
+            path,
+            FILE_READ_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL,
+            FILE_SHARE_READ,
+            IntPtr.Zero,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            IntPtr.Zero);
+        if (handle == null || handle.IsInvalid) {
+            int error = Marshal.GetLastWin32Error();
+            if (handle != null) {
+                handle.Dispose();
+            }
+            if (error == 2 || error == 3) {
+                throw new FileNotFoundException("The file was not found.", path);
+            }
+            throw new Win32Exception(error);
+        }
+
+        try {
+            ByHandleFileInformation info;
+            if (!GetFileInformationByHandle(handle, out info)) {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+
+            FsrmTrustedFile trusted = new FsrmTrustedFile();
+            trusted.IsReparsePoint = (info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+            trusted.IsDirectory = (info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            if (info.NumberOfLinks > int.MaxValue) {
+                trusted.LinkCountFits = false;
+            }
+            else {
+                trusted.LinkCountFits = true;
+                trusted.LinkCount = (int)info.NumberOfLinks;
+            }
+
+            IntPtr owner;
+            IntPtr group;
+            IntPtr dacl;
+            IntPtr sacl;
+            IntPtr securityDescriptor;
+            uint securityResult = GetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                out owner,
+                out group,
+                out dacl,
+                out sacl,
+                out securityDescriptor);
+            if (securityResult != 0) {
+                throw new Win32Exception((int)securityResult);
+            }
+            try {
+                trusted.HasDacl = dacl != IntPtr.Zero;
+                if (owner != IntPtr.Zero) {
+                    trusted.OwnerSid = new SecurityIdentifier(owner).Value;
+                }
+                if (dacl != IntPtr.Zero) {
+                    AclSizeInformation size = new AclSizeInformation();
+                    if (!GetAclInformation(dacl, ref size, (uint)Marshal.SizeOf(typeof(AclSizeInformation)), ACL_SIZE_INFORMATION_CLASS)) {
+                        throw new Win32Exception(Marshal.GetLastWin32Error());
+                    }
+                    string[] sids = new string[size.AceCount];
+                    for (int index = 0; index < size.AceCount; index++) {
+                        IntPtr ace;
+                        if (!GetAce(dacl, index, out ace)) {
+                            throw new Win32Exception(Marshal.GetLastWin32Error());
+                        }
+                        AceHeader header = (AceHeader)Marshal.PtrToStructure(ace, typeof(AceHeader));
+                        if (header.AceType == ACCESS_DENIED_ACE_TYPE) {
+                            trusted.HasDenyAce = true;
+                        }
+                        else if (header.AceType != ACCESS_ALLOWED_ACE_TYPE) {
+                            trusted.HasUnexpectedAce = true;
+                        }
+                        if (header.AceSize < 8) {
+                            trusted.HasUnexpectedAce = true;
+                            continue;
+                        }
+                        sids[index] = new SecurityIdentifier(new IntPtr(ace.ToInt64() + 8)).Value;
+                    }
+                    trusted.AceSids = sids;
+                }
+            }
+            finally {
+                if (securityDescriptor != IntPtr.Zero) {
+                    LocalFree(securityDescriptor);
+                }
+            }
+
+            if (!trusted.IsReparsePoint && !trusted.IsDirectory && trusted.LinkCountFits && trusted.LinkCount == 1) {
+                System.Collections.Generic.List<byte> content = new System.Collections.Generic.List<byte>();
+                byte[] chunk = new byte[81920];
+                int read;
+                while (true) {
+                    if (!ReadFile(handle, chunk, chunk.Length, out read, IntPtr.Zero)) {
+                        throw new Win32Exception(Marshal.GetLastWin32Error());
+                    }
+                    if (read == 0) {
+                        break;
+                    }
+                    for (int i = 0; i < read; i++) {
+                        content.Add(chunk[i]);
+                    }
+                }
+                trusted.Bytes = content.ToArray();
+            }
+            return trusted;
+        }
+        finally {
+            handle.Dispose();
+        }
+    }
+}
+'@
+
+    Add-Type -TypeDefinition $typeDefinition -Language CSharp -ErrorAction Stop
+}
+
+function Get-UnfollowedFileFacts {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    if ($env:OS -ne 'Windows_NT') {
+        throw "Reading a file without following links requires Windows."
+    }
+
+    Initialize-FileHandleNative
+    try {
+        $facts = [FsrmScriptFileHandle]::Read($Path)
+    }
+    catch {
+        $inner = $_.Exception
+        while ($null -ne $inner.InnerException) {
+            $inner = $inner.InnerException
+        }
+        if ($inner -is [System.IO.FileNotFoundException]) {
+            return $null
+        }
+        throw
+    }
+
+    $linkCount = $facts.LinkCount
+    if ($linkCount -isnot [int]) {
+        $linkCount = $null
+    }
+
+    return [pscustomobject]@{
+        Exists         = $true
+        LinkCount      = $linkCount
+        IsReparsePoint = [bool]$facts.IsReparsePoint
+        IsDirectory    = [bool]$facts.IsDirectory
+    }
+}
+
+function Get-ExplicitAceSummary {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    Initialize-FileSecurityTypes
+    $identifier = [System.Security.Principal.SecurityIdentifier]
+    $acl = Get-Acl -LiteralPath $Path
+    # Include inherited ACEs. A leftover file can still grant write access through one.
+    $rules = @($acl.GetAccessRules($true, $true, $identifier))
+    $sids = New-Object System.Collections.Generic.List[string]
+    $hasDeny = $false
+    foreach ($rule in $rules) {
+        if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) {
+            $hasDeny = $true
+        }
+        [void]$sids.Add([string]$rule.IdentityReference.Value)
+    }
+
+    return [pscustomobject]@{
+        OwnerSid   = $acl.GetOwner($identifier).Value
+        AceSids    = @($sids)
+        HasDenyAce = [bool]$hasDeny
+    }
+}
+
+function Assert-ScriptsDirectoryChildren {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Directory
+    )
+
+    foreach ($child in @(Get-DirectoryChildPathsWithoutFollowing -Path $Directory)) {
+        if ([string]::IsNullOrWhiteSpace($child)) {
+            continue
+        }
+
+        $name = [System.IO.Path]::GetFileName($child)
+        $handle = Get-UnfollowedFileFacts -Path $child
+        if ($null -eq $handle) {
+            throw "Refusing C:\scripts because '$name' disappeared while it was being checked. Run this script again."
+        }
+
+        $ownerSid = $null
+        $aceSids = @()
+        $hasDeny = $false
+        if (-not $handle.IsReparsePoint -and -not $handle.IsDirectory -and ($handle.LinkCount -is [int]) -and ($handle.LinkCount -eq 1)) {
+            $acl = Get-ExplicitAceSummary -Path $child
+            $ownerSid = $acl.OwnerSid
+            $aceSids = $acl.AceSids
+            $hasDeny = $acl.HasDenyAce
+        }
+
+        Assert-ScriptsChildIsSafe -Name $name -IsReparsePoint $handle.IsReparsePoint -IsDirectory $handle.IsDirectory -LinkCount $handle.LinkCount -OwnerSid $ownerSid -AceSids $aceSids -HasDenyAce $hasDeny
+    }
+}
+
+function Write-NewScriptFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$Content
+    )
+
+    if ($env:OS -ne 'Windows_NT') {
+        throw "Creating a script file requires Windows."
+    }
+
+    $handle = Get-UnfollowedFileFacts -Path $Path
+    if ($null -ne $handle) {
+        $name = [System.IO.Path]::GetFileName($Path)
+        $ownerSid = $null
+        $aceSids = @()
+        $hasDeny = $false
+        if (-not $handle.IsReparsePoint -and -not $handle.IsDirectory -and ($handle.LinkCount -is [int]) -and ($handle.LinkCount -eq 1)) {
+            $acl = Get-ExplicitAceSummary -Path $Path
+            $ownerSid = $acl.OwnerSid
+            $aceSids = $acl.AceSids
+            $hasDeny = $acl.HasDenyAce
+        }
+
+        Assert-ScriptsChildIsSafe -Name $name -IsReparsePoint $handle.IsReparsePoint -IsDirectory $handle.IsDirectory -LinkCount $handle.LinkCount -OwnerSid $ownerSid -AceSids $aceSids -HasDenyAce $hasDeny
+        [FsrmScriptFileHandle]::Delete($Path)
+    }
+
+    $stream = [System.IO.File]::Open(
+        $Path,
+        [System.IO.FileMode]::CreateNew,
+        [System.IO.FileAccess]::Write,
+        [System.IO.FileShare]::None)
+    try {
+        $encoding = [System.Text.UTF8Encoding]::new($false)
+        $bytes = $encoding.GetBytes($Content)
+        $stream.Write($bytes, 0, $bytes.Length)
+    }
+    finally {
+        $stream.Dispose()
+    }
+
+    # Windows keeps the old creation time when a name is deleted and created again.
+    Set-ReplacedFileTimestamp -Path $Path
+}
+
+function Set-ReplacedFileTimestamp {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $item = Get-Item -LiteralPath $Path -Force
+    $stamp = [datetime]::UtcNow
+    $item.CreationTimeUtc = $stamp
+    $item.LastWriteTimeUtc = $stamp
+}
+
+function Get-EmailFileReplacementPlan {
+    param(
+        [Parameter(Mandatory = $true)]
+        [bool]$SourceExists,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$DestinationExists
+    )
+
+    if (-not $SourceExists) {
+        throw "Cannot replace C:\scripts\Email.py because C:\FSRM\Email.py is missing. The existing script was left unchanged. Restore a trusted Email.py to C:\FSRM\ and run this script again."
+    }
+
+    if ($DestinationExists) {
+        return 'DeleteThenCreate'
+    }
+
+    return 'Create'
+}
+
+function Set-ScriptsDirectorySecurityByHandle {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    if ($env:OS -ne 'Windows_NT') {
+        throw "Protecting C:\scripts requires Windows."
+    }
+
+    Initialize-FileHandleNative
+    [FsrmScriptFileHandle]::ProtectDirectory($Path)
+}
+
+function Assert-TrustedEmailSource {
+    param(
+        [Parameter(Mandatory = $true)]
+        [bool]$Exists,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$IsReparsePoint,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$IsDirectory,
+
+        $LinkCount,
+
+        [string]$OwnerSid,
+
+        [string[]]$AceSids,
+
+        [bool]$HasDenyAce,
+
+        [bool]$HasDacl = $true,
+
+        [bool]$HasUnexpectedAce
+    )
+
+    $rerun = ' No changes were made. Restore a trusted Email.py to C:\FSRM\ and run this script again.'
+    if (-not $Exists) {
+        throw "C:\FSRM\Email.py is missing.$rerun"
+    }
+    if ($IsReparsePoint) {
+        throw "C:\FSRM\Email.py is a reparse point (junction or symlink), not a regular file.$rerun"
+    }
+    if ($IsDirectory) {
+        throw "C:\FSRM\Email.py is a directory, not a regular file.$rerun"
+    }
+    if (($LinkCount -isnot [int]) -or ($LinkCount -ne 1)) {
+        throw "C:\FSRM\Email.py does not have a link count of 1.$rerun"
+    }
+    if ($OwnerSid -ne 'S-1-5-32-544' -and $OwnerSid -ne 'S-1-5-18') {
+        throw "C:\FSRM\Email.py is not owned by Administrators or SYSTEM.$rerun"
+    }
+    if ((-not $HasDacl) -or $HasDenyAce -or $HasUnexpectedAce) {
+        throw "C:\FSRM\Email.py does not grant access only to Administrators and SYSTEM.$rerun"
+    }
+
+    $protectedSids = @('S-1-5-32-544', 'S-1-5-18')
+    $sawProtected = $false
+    foreach ($sid in @($AceSids)) {
+        if ([string]::IsNullOrWhiteSpace($sid) -or ($protectedSids -notcontains $sid)) {
+            throw "C:\FSRM\Email.py does not grant access only to Administrators and SYSTEM.$rerun"
+        }
+        $sawProtected = $true
+    }
+    if (-not $sawProtected) {
+        throw "C:\FSRM\Email.py does not grant access only to Administrators and SYSTEM.$rerun"
+    }
+}
+
+function Invoke-SetupAfterTrustedEmailSource {
+    param(
+        [Parameter(Mandatory = $true)]
+        [bool]$Exists,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$IsReparsePoint,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$IsDirectory,
+
+        $LinkCount,
+
+        [string]$OwnerSid,
+
+        [string[]]$AceSids,
+
+        [bool]$HasDenyAce,
+
+        [bool]$HasDacl = $true,
+
+        [bool]$HasUnexpectedAce,
+
+        [Parameter(Mandatory = $true)]
+        [scriptblock]$Change
+    )
+
+    Assert-TrustedEmailSource -Exists $Exists -IsReparsePoint $IsReparsePoint -IsDirectory $IsDirectory -LinkCount $LinkCount -OwnerSid $OwnerSid -AceSids $AceSids -HasDenyAce $HasDenyAce -HasDacl $HasDacl -HasUnexpectedAce $HasUnexpectedAce
+    & $Change
+}
+
+function Read-TrustedEmailFile {
+    param(
+        [string]$Path = 'C:\FSRM\Email.py'
+    )
+
+    if ($env:OS -ne 'Windows_NT') {
+        throw "Validating C:\FSRM\Email.py requires Windows."
+    }
+
+    Initialize-FileHandleNative
+    $raw = $null
+    try {
+        $raw = [FsrmScriptFileHandle]::ReadTrusted($Path)
+    }
+    catch {
+        $inner = $_.Exception
+        while ($null -ne $inner.InnerException) {
+            $inner = $inner.InnerException
+        }
+        if ($inner -is [System.IO.FileNotFoundException]) {
+            Assert-TrustedEmailSource -Exists $false -IsReparsePoint $false -IsDirectory $false -LinkCount $null -HasDacl $false
+        }
+        throw
+    }
+
+    $linkCount = $null
+    if ($raw.LinkCountFits -and ($raw.LinkCount -is [int])) {
+        $linkCount = $raw.LinkCount
+    }
+    Assert-TrustedEmailSource -Exists $true -IsReparsePoint $raw.IsReparsePoint -IsDirectory $raw.IsDirectory -LinkCount $linkCount -OwnerSid $raw.OwnerSid -AceSids $raw.AceSids -HasDenyAce $raw.HasDenyAce -HasDacl $raw.HasDacl -HasUnexpectedAce $raw.HasUnexpectedAce
+    Assert-TrustedEmailBytes -Bytes $raw.Bytes
+    return ,$raw.Bytes
+}
+
+function Assert-TrustedEmailBytes {
+    param($Bytes)
+
+    if ($null -eq $Bytes -or $Bytes.Length -eq 0) {
+        throw "C:\FSRM\Email.py is empty. No changes were made. Restore a trusted Email.py to C:\FSRM\ and run this script again."
+    }
+}
+
+function Install-ProtectedEmailScript {
+    param(
+        [string]$SourcePath = 'C:\FSRM\Email.py',
+        [string]$DestinationPath = 'C:\scripts\Email.py'
+    )
+
+    if ($null -eq $script:trustedEmailBytes) {
+        throw "C:\FSRM\Email.py was not validated. No changes were made. Restore a trusted Email.py to C:\FSRM\ and run this script again."
+    }
+    Assert-TrustedEmailBytes -Bytes $script:trustedEmailBytes
+
+    if ($env:OS -ne 'Windows_NT') {
+        throw "Replacing Email.py requires Windows."
+    }
+
+    $bytes = $script:trustedEmailBytes
+    $destinationFacts = Get-UnfollowedFileFacts -Path $DestinationPath
+    $plan = Get-EmailFileReplacementPlan -SourceExists $true -DestinationExists ($null -ne $destinationFacts)
+    if ($plan -eq 'DeleteThenCreate') {
+        $name = [System.IO.Path]::GetFileName($DestinationPath)
+        $ownerSid = $null
+        $aceSids = @()
+        $hasDeny = $false
+        if (-not $destinationFacts.IsReparsePoint -and -not $destinationFacts.IsDirectory -and ($destinationFacts.LinkCount -is [int]) -and ($destinationFacts.LinkCount -eq 1)) {
+            $acl = Get-ExplicitAceSummary -Path $DestinationPath
+            $ownerSid = $acl.OwnerSid
+            $aceSids = $acl.AceSids
+            $hasDeny = $acl.HasDenyAce
+        }
+
+        Assert-ScriptsChildIsSafe -Name $name -IsReparsePoint $destinationFacts.IsReparsePoint -IsDirectory $destinationFacts.IsDirectory -LinkCount $destinationFacts.LinkCount -OwnerSid $ownerSid -AceSids $aceSids -HasDenyAce $hasDeny
+        [FsrmScriptFileHandle]::Delete($DestinationPath)
+    }
+
+    $stream = [System.IO.File]::Open(
+        $DestinationPath,
+        [System.IO.FileMode]::CreateNew,
+        [System.IO.FileAccess]::Write,
+        [System.IO.FileShare]::None)
+    try {
+        $stream.Write($bytes, 0, $bytes.Length)
+    }
+    finally {
+        $stream.Dispose()
+    }
+
+    Set-ReplacedFileTimestamp -Path $DestinationPath
+    Set-ProtectedFileAcl -Path $DestinationPath
+    [FsrmScriptFileHandle]::Delete($SourcePath)
+}
+
+function Initialize-ProtectedScriptsDirectory {
+    param(
+        [string]$Path = 'C:\scripts'
+    )
+
+    if ($env:OS -ne 'Windows_NT') {
+        throw "Creating a protected scripts directory requires Windows."
+    }
+
+    Initialize-FileSecurityTypes
+    $facts = Get-DownloadDirectoryFacts -Path $Path
+    $action = Get-ScriptsDirectoryAction -Exists $facts.Exists -IsReparsePoint $facts.IsReparsePoint -IsDirectory $facts.IsDirectory -OwnerSid $facts.OwnerSid
+    if ($action -eq 'Create') {
+        New-DirectoryWithProtectedAcl -Path $Path
+    }
+    elseif ($action -eq 'ResetDacl') {
+        # One open of this directory: reject a junction, then set the owner and DACL on that handle.
+        Set-ScriptsDirectorySecurityByHandle -Path $Path
+        Assert-ScriptsDirectoryChildren -Directory $Path
+    }
+    else {
+        throw "Unexpected scripts directory action '$action'."
+    }
+
+    Assert-ProtectedDirectoryAcl -Path $Path
+}
+
+function Remove-PythonDownloadDirectory {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return
+    }
+
+    $facts = Get-DownloadDirectoryFacts -Path $Path
+    if (-not $facts.Exists) {
+        return
+    }
+    if ($facts.IsReparsePoint) {
+        throw "Refusing to remove the Python download directory because it is a reparse point (junction or symlink)."
+    }
+    if ($env:OS -eq 'Windows_NT' -and $facts.OwnerSid -ne 'S-1-5-32-544') {
+        throw "Refusing to remove the Python download directory because it is not owned by Administrators (S-1-5-32-544)."
+    }
+
+    $children = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop)
+    foreach ($child in $children) {
+        $childFacts = Get-DownloadDirectoryFacts -Path $child.FullName
+        if ($childFacts.IsReparsePoint) {
+            throw "Refusing to remove '$($child.FullName)' because it is a reparse point (junction or symlink)."
+        }
+    }
+
+    Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+}
+
+function Invoke-ActionPreservingOriginalError {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [scriptblock]$Action,
+
+        [Parameter(Mandatory = $true)]
+        [scriptblock]$Cleanup
+    )
+
+    $failure = $null
+    try {
+        & $Action
+    }
+    catch {
+        $failure = $_
+    }
+    finally {
+        try {
+            & $Cleanup
+        }
+        catch {
+            if ($null -eq $failure) {
+                $failure = $_
+            }
+            else {
+                Write-Warning ("The Python download directory could not be removed: " + $_.Exception.Message)
+            }
+        }
+    }
+
+    if ($null -ne $failure) {
+        $PSCmdlet.ThrowTerminatingError($failure)
+    }
+}
+
+function New-RestrictedPythonDownloadDirectory {
+    if ($env:OS -ne 'Windows_NT') {
+        throw "Creating a private Python download directory requires Windows."
+    }
+
+    $programData = $env:ProgramData
+    if ([string]::IsNullOrWhiteSpace($programData)) {
+        throw "ProgramData is not set. Refusing to choose a Python download directory."
+    }
+
+    Initialize-FileSecurityTypes
+    $path = Join-Path $programData ('fsrm-python-' + [guid]::NewGuid().ToString('n'))
+
+    $facts = Get-DownloadDirectoryFacts -Path $path
+    Assert-ExistingDownloadDirectory -Exists $facts.Exists -IsReparsePoint $facts.IsReparsePoint -OwnerSid $facts.OwnerSid
+
+    New-DirectoryWithProtectedAcl -Path $path
+
+    $createdFacts = Get-DownloadDirectoryFacts -Path $path
+    try {
+        Assert-DownloadDirectoryIsSafe -IsReparsePoint $createdFacts.IsReparsePoint -OwnerSid $createdFacts.OwnerSid
+    }
+    catch {
+        # Do not delete a folder that is not owned by Administrators or is a reparse point.
+        throw
+    }
+
+    return $path
+}
+
+# Check the source email script before FSRM, C:\scripts, or any ACL is changed.
+# A previous run may already have stopped after creating C:\scripts. A failed
+# check here returns before that directory or FSRM is modified again.
+$script:trustedEmailBytes = Read-TrustedEmailFile -Path 'C:\FSRM\Email.py'
+
+Install-FSRMRansomware -SMTPServer $SMTPServer -EmailTo $EmailTo -EmailFrom $EmailFrom
+
+# Install supported Python 3.12 for Email.py.
+# Python 3.12.10 is the latest 3.12.x release published as a Windows installer on
+# python.org. Later 3.12 releases are source-only security updates.
+# Prefer winget when it is available. Otherwise download the official installer
+# into a new private directory and abort unless Get-FileHash matches the SHA256
+# published for that python.org file.
+$pythonVersion = "3.12.10"
+$pythonInstallerName = "python-$pythonVersion-amd64.exe"
+$pythonUrl = "https://www.python.org/ftp/python/$pythonVersion/$pythonInstallerName"
+$pythonSha256 = "67B5635E80EA51072B87941312D00EC8927C4DB9BA18938F7AD2D27B328B95FB"
+Assert-PythonInstallerSha256 -Sha256 $pythonSha256
+
+$wingetCommand = Get-Command winget -ErrorAction SilentlyContinue
+if ($wingetCommand) {
+    Write-Host "Installing Python 3.12 with winget (Python.Python.3.12)"
+    & winget install --id Python.Python.3.12 -e --scope machine --accept-package-agreements --accept-source-agreements
+    # 0x8A15002B: no newer version. 0x8A150061: already installed.
+    $wingetAlreadyInstalled = @(-1978335189, -1978335135, 2316632107, 2316632161)
+    if ($LASTEXITCODE -ne 0 -and $wingetAlreadyInstalled -notcontains $LASTEXITCODE) {
+        throw "winget failed to install Python.Python.3.12 (exit code $LASTEXITCODE). Aborting."
+    }
+}
+else {
+    $downloadDirectory = $null
+    Invoke-ActionPreservingOriginalError -Action {
+        $script:downloadDirectory = New-RestrictedPythonDownloadDirectory
+        $pythonInstallerPath = Join-Path $script:downloadDirectory $pythonInstallerName
+        Assert-ChildPathInsideDirectory -Directory $script:downloadDirectory -ChildPath $pythonInstallerPath
+
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $pythonUrl -OutFile $pythonInstallerPath -UseBasicParsing -ErrorAction Stop
+
+        Assert-ChildPathInsideDirectory -Directory $script:downloadDirectory -ChildPath $pythonInstallerPath
+        $installerFacts = Get-DownloadDirectoryFacts -Path $pythonInstallerPath
+        if ($installerFacts.IsReparsePoint) {
+            throw "Refusing to run the Python installer because it is a reparse point (junction or symlink)."
+        }
+
+        $actualHash = (Get-FileHash -LiteralPath $pythonInstallerPath -Algorithm SHA256).Hash.ToUpperInvariant()
+        if ($actualHash -ne $pythonSha256.ToUpperInvariant()) {
+            throw "SHA256 mismatch for $pythonInstallerName. Expected the official python.org SHA256 $pythonSha256 but Get-FileHash returned $actualHash. Aborting."
+        }
+
+        Invoke-PythonInstaller -FilePath $pythonInstallerPath -ArgumentList @('/quiet', 'InstallAllUsers=1', 'PrependPath=1', 'Include_test=0') -CommandName "Python $pythonVersion installer"
+    } -Cleanup {
+        Remove-PythonDownloadDirectory -Path $script:downloadDirectory
+    }
+}
+
+Write-Host "Python was installed. Open a new shell, or refresh PATH, before using python."
+
+Initialize-ProtectedScriptsDirectory
 Start-Sleep -Seconds 2
-Move-Item -Path "C:\FSRM\Email.py" -Destination "C:\scripts\"
+Install-ProtectedEmailScript
