@@ -74,7 +74,8 @@ function Install-FSRMRansomware {
     
                 #Create File Group for FSRM 
                 #To Update Extentions https://fsrm.experiant.ca/api/v1/get Current is 4347 Extentions
-                New-FsrmFileGroup -name "Ransomware Files" -IncludePattern @( 
+                # A previous run may already have created this group. Update it instead of failing.
+                $ransomwareIncludePattern = @( 
                             "*DECRYPT_INSTRUCTION.HTML*",
                             "*HELP_DECRYPT.HTML*", 
                             "*decrypt all files*.bmp*", 
@@ -4469,19 +4470,43 @@ function Install-FSRMRansomware {
                             "*.blocatto",
                             "*.8lock8",
                             "*.777")
-                            
-
-
+                $existingRansomwareGroup = $null
+                try {
+                    $existingRansomwareGroup = Get-FsrmFileGroup -Name "Ransomware Files" -ErrorAction Stop
+                } catch {
+                    if ($_.Exception.Message -notmatch '80045301|was not found|cannot find|does not exist') {
+                        throw
+                    }
+                }
+                if ((Get-FsrmSetupAction -Exists ($null -ne $existingRansomwareGroup)) -eq 'Create') {
+                    New-FsrmFileGroup -Name "Ransomware Files" -IncludePattern $ransomwareIncludePattern
+                } else {
+                    Set-FsrmFileGroup -Name "Ransomware Files" -IncludePattern $ransomwareIncludePattern
+                }
 
             #Create FSRM Template xml file and import template then remove xml file
             $FSRMTemplate = @"
 <?xml version="1.0" ?><Root ><Header DatabaseVersion = '2.0' ></Header><QuotaTemplates ></QuotaTemplates><DatascreenTemplates ><DatascreenTemplate Name = 'RansomwareCheck' Id = '{122F5AB4-9DF0-4F09-B89E-0F7BDC9D46CC}' Flags = '1' Description = '' ><BlockedGroups ><FileGroup FileGroupId = '{82D08F60-7319-4BE2-8621-066DB91A958E}' Name = 'Ransomware%sFiles' ></FileGroup></BlockedGroups><FileGroupActions ><Action Type="1" Id="{73AFB339-FF17-42DC-B9B9-E7C9A8E7C9A9}" EventType="2" MessageText="User%s[Source%sIo%sOwner]%sattempted%sto%ssave%s[Source%sFile%sPath]%sto%s[File%sScreen%sPath]%son%sthe%s[Server]%sserver.%sThis%sfile%sis%sin%sthe%s[Violated%sFile%sGroup]%sfile%sgroup,%swhich%sis%snot%spermitted%son%sthe%sserver." /><Action Type="3" Id="{D0B80CC5-E6DD-481C-9534-19944A851A72}" ExecutablePath="C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" Arguments="&quot;C:\Scripts\ScriptToDenyPermissions.PS1&quot;" WorkingDirectory="C:\Windows\System32\WindowsPowerShell\v1.0\" Account="3" MonitorCommand="0" KillTimeOut="0" LogResult="1" CurrentSid="S-1-5-21-3468280891-3112941812-1175424509-500" /></FileGroupActions></DatascreenTemplate></DatascreenTemplates><FileGroups ></FileGroups></Root>
 "@
-            $FSRMTemplate | Out-File -FilePath C:\users\public\FSRMTemplate.xml 
-
-            Filescrn template import /file:C:\users\public\FSRMTemplate.xml 
-
-            Remove-Item -path C:\Users\Public\FSRMTemplate.xml 
+            $existingScreenTemplate = $null
+            try {
+                $existingScreenTemplate = Get-FsrmFileScreenTemplate -Name "RansomwareCheck" -ErrorAction Stop
+            } catch {
+                if ($_.Exception.Message -notmatch '80045301|was not found|cannot find|does not exist') {
+                    throw
+                }
+            }
+            if ((Get-FsrmSetupAction -Exists ($null -ne $existingScreenTemplate)) -eq 'Create') {
+                $fsrmTemplatePath = "C:\Users\Public\FSRMTemplate.xml"
+                # filescrn.exe rejects a UTF-8 template. Unicode is UTF-16LE.
+                $FSRMTemplate | Out-File -FilePath $fsrmTemplatePath -Encoding Unicode
+                try {
+                    & filescrn.exe template import "/file:$fsrmTemplatePath"
+                    Assert-NativeCommandSucceeded -CommandName "filescrn template import" -ExitCode $LASTEXITCODE
+                } finally {
+                    Remove-Item -LiteralPath $fsrmTemplatePath -Force -ErrorAction SilentlyContinue
+                }
+            } 
 
 
             #Creates Script Block to perform email message and block SMB Permissions. Exports script block to a PS1 for the File Screen Template.
@@ -4523,8 +4548,18 @@ function Install-FSRMRansomware {
             $disks = GET-WMIOBJECT win32_logicaldisk -filter "DriveType='3'" | Where-Object {$_.deviceid -ne "C:"}
             ForEach($disk in $disks) {
                                         $DRIVE = $DISK.DeviceID
-
-                                        New-FSRMFILEScreen -path "$DRIVE\" -template "RansomwareCheck"
+                                        $screenPath = "$DRIVE\"
+                                        $existingScreen = $null
+                                        try {
+                                            $existingScreen = Get-FsrmFileScreen -Path $screenPath -ErrorAction Stop
+                                        } catch {
+                                            if ($_.Exception.Message -notmatch '80045301|was not found|cannot find|does not exist') {
+                                                throw
+                                            }
+                                        }
+                                        if ((Get-FsrmSetupAction -Exists ($null -ne $existingScreen)) -eq 'Create') {
+                                            New-FsrmFileScreen -Path $screenPath -Template "RansomwareCheck"
+                                        }
 
                                      }
 
@@ -4535,6 +4570,31 @@ function Install-FSRMRansomware {
 }
 # SMTPServer, EmailTo, and EmailFrom are required parameters.
 # Supply them when running this script. Example addresses are not embedded here.
+
+function Get-FsrmSetupAction {
+    param(
+        [Parameter(Mandatory = $true)]
+        [bool]$Exists
+    )
+
+    if ($Exists) {
+        return 'Reuse'
+    }
+    return 'Create'
+}
+
+function Assert-NativeCommandSucceeded {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$CommandName,
+
+        $ExitCode
+    )
+
+    if (($ExitCode -isnot [int]) -or ($ExitCode -ne 0)) {
+        throw "$CommandName failed with exit code $ExitCode."
+    }
+}
 
 function Assert-PythonInstallerSha256 {
     param(
@@ -5778,6 +5838,8 @@ function New-RestrictedPythonDownloadDirectory {
 }
 
 # Check the source email script before FSRM, C:\scripts, or any ACL is changed.
+# A previous run may already have stopped after creating C:\scripts. A failed
+# check here returns before that directory or FSRM is modified again.
 $script:trustedEmailBytes = Read-TrustedEmailFile -Path 'C:\FSRM\Email.py'
 
 Install-FSRMRansomware -SMTPServer $SMTPServer -EmailTo $EmailTo -EmailFrom $EmailFrom
@@ -5826,9 +5888,7 @@ else {
         }
 
         & $pythonInstallerPath /quiet InstallAllUsers=1 PrependPath=1 Include_test=0
-        if ($LASTEXITCODE -ne 0) {
-            throw "Python $pythonVersion installer failed with exit code $LASTEXITCODE. Aborting."
-        }
+        Assert-NativeCommandSucceeded -CommandName "Python $pythonVersion installer" -ExitCode $LASTEXITCODE
     } -Cleanup {
         Remove-PythonDownloadDirectory -Path $script:downloadDirectory
     }
