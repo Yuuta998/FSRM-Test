@@ -40,3 +40,13 @@ icacls C:\FSRM\Email.py /setowner *S-1-5-32-544
 ```
 
 A successful run removes `C:\FSRM\Email.py`. If that file is missing or is not trusted, the script stops without changing FSRM or `C:\scripts`. Restore a trusted `Email.py` to `C:\FSRM\` and run the script again.
+
+## Leftover template XML
+
+Setup writes a temporary `C:\scripts\FSRMTemplate-*.xml` while it imports the file screen template, then deletes that file. If setup is interrupted before the delete, the XML stays in `C:\scripts`. The next run refuses the directory, because the only files allowed there are `Email.py` and `ScriptToDenyPermissions.PS1`.
+
+Confirm that no setup is running. From an elevated prompt, delete the leftover file, then run the script again:
+
+```powershell
+Get-ChildItem -LiteralPath C:\scripts -Filter 'FSRMTemplate-*.xml' -Force | Remove-Item -Force
+```
