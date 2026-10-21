@@ -26,3 +26,9 @@ Do not commit the password or write it into `Email.py`.
 The script installs Python 3.12 instead of end-of-life Python 3.7.6. It uses `winget` (`Python.Python.3.12`) when `winget` is available. Otherwise it downloads the official Python 3.12.10 Windows x64 installer from python.org — the latest 3.12.x release published with a Windows installer — into a new private directory, checks its SHA256 with `Get-FileHash`, and removes that directory after the installer finishes. The install stops if the hash does not match `67B5635E80EA51072B87941312D00EC8927C4DB9BA18938F7AD2D27B328B95FB`.
 
 Open a new shell, or refresh PATH in the current one, before using `python`. The shell that ran the script does not see the updated PATH.
+
+## Running the script again
+
+Before each run, restore a trusted `Email.py` to `C:\FSRM\Email.py`. The script checks that file before it changes FSRM or `C:\scripts`. The file must be a regular file, not a junction or symlink. Its owner must be Administrators or SYSTEM, its access list must grant access only to Administrators and SYSTEM, and it must have a single link.
+
+A successful run removes `C:\FSRM\Email.py`. If that file is missing or is not trusted, the script stops without changing FSRM or `C:\scripts`. Restore a trusted `Email.py` to `C:\FSRM\` and run the script again.

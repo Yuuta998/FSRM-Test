@@ -4945,6 +4945,19 @@ public sealed class FsrmFileHandleFacts {
     public bool IsDirectory { get; set; }
 }
 
+public sealed class FsrmTrustedFile {
+    public int LinkCount { get; set; }
+    public bool LinkCountFits { get; set; }
+    public bool IsReparsePoint { get; set; }
+    public bool IsDirectory { get; set; }
+    public bool HasDacl { get; set; }
+    public bool HasDenyAce { get; set; }
+    public bool HasUnexpectedAce { get; set; }
+    public string OwnerSid { get; set; }
+    public string[] AceSids { get; set; }
+    public byte[] Bytes { get; set; }
+}
+
 public static class FsrmScriptFileHandle {
     private const uint FILE_READ_ATTRIBUTES = 0x0080;
     private const uint FILE_SHARE_READ = 0x00000001;
@@ -5005,6 +5018,57 @@ public static class FsrmScriptFileHandle {
         IntPtr group,
         IntPtr dacl,
         IntPtr sacl);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern uint GetSecurityInfo(
+        SafeFileHandle handle,
+        uint objectType,
+        uint securityInfo,
+        out IntPtr owner,
+        out IntPtr group,
+        out IntPtr dacl,
+        out IntPtr sacl,
+        out IntPtr securityDescriptor);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool GetAclInformation(
+        IntPtr acl,
+        ref AclSizeInformation information,
+        uint length,
+        int informationClass);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool GetAce(IntPtr acl, int index, out IntPtr ace);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr LocalFree(IntPtr handle);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool ReadFile(
+        SafeFileHandle handle,
+        byte[] buffer,
+        int bytesToRead,
+        out int bytesRead,
+        IntPtr overlapped);
+
+    private const uint FILE_READ_DATA = 0x0001;
+    private const int ACL_SIZE_INFORMATION_CLASS = 2;
+    private const byte ACCESS_ALLOWED_ACE_TYPE = 0;
+    private const byte ACCESS_DENIED_ACE_TYPE = 1;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct AclSizeInformation {
+        public uint AceCount;
+        public uint AclBytesInUse;
+        public uint AclBytesFree;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct AceHeader {
+        public byte AceType;
+        public byte AceFlags;
+        public ushort AceSize;
+    }
 
     public static FsrmFileHandleFacts Read(string path) {
         SafeFileHandle handle = CreateFile(
@@ -5108,6 +5172,122 @@ public static class FsrmScriptFileHandle {
                 ownerHandle.Free();
                 daclHandle.Free();
             }
+        }
+        finally {
+            handle.Dispose();
+        }
+    }
+
+    public static FsrmTrustedFile ReadTrusted(string path) {
+        SafeFileHandle handle = CreateFile(
+            path,
+            FILE_READ_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL,
+            FILE_SHARE_READ,
+            IntPtr.Zero,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            IntPtr.Zero);
+        if (handle == null || handle.IsInvalid) {
+            int error = Marshal.GetLastWin32Error();
+            if (handle != null) {
+                handle.Dispose();
+            }
+            if (error == 2 || error == 3) {
+                throw new FileNotFoundException("The file was not found.", path);
+            }
+            throw new Win32Exception(error);
+        }
+
+        try {
+            ByHandleFileInformation info;
+            if (!GetFileInformationByHandle(handle, out info)) {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+
+            FsrmTrustedFile trusted = new FsrmTrustedFile();
+            trusted.IsReparsePoint = (info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+            trusted.IsDirectory = (info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            if (info.NumberOfLinks > int.MaxValue) {
+                trusted.LinkCountFits = false;
+            }
+            else {
+                trusted.LinkCountFits = true;
+                trusted.LinkCount = (int)info.NumberOfLinks;
+            }
+
+            IntPtr owner;
+            IntPtr group;
+            IntPtr dacl;
+            IntPtr sacl;
+            IntPtr securityDescriptor;
+            uint securityResult = GetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                out owner,
+                out group,
+                out dacl,
+                out sacl,
+                out securityDescriptor);
+            if (securityResult != 0) {
+                throw new Win32Exception((int)securityResult);
+            }
+            try {
+                trusted.HasDacl = dacl != IntPtr.Zero;
+                if (owner != IntPtr.Zero) {
+                    trusted.OwnerSid = new SecurityIdentifier(owner).Value;
+                }
+                if (dacl != IntPtr.Zero) {
+                    AclSizeInformation size = new AclSizeInformation();
+                    if (!GetAclInformation(dacl, ref size, (uint)Marshal.SizeOf(typeof(AclSizeInformation)), ACL_SIZE_INFORMATION_CLASS)) {
+                        throw new Win32Exception(Marshal.GetLastWin32Error());
+                    }
+                    string[] sids = new string[size.AceCount];
+                    for (int index = 0; index < size.AceCount; index++) {
+                        IntPtr ace;
+                        if (!GetAce(dacl, index, out ace)) {
+                            throw new Win32Exception(Marshal.GetLastWin32Error());
+                        }
+                        AceHeader header = (AceHeader)Marshal.PtrToStructure(ace, typeof(AceHeader));
+                        if (header.AceType == ACCESS_DENIED_ACE_TYPE) {
+                            trusted.HasDenyAce = true;
+                        }
+                        else if (header.AceType != ACCESS_ALLOWED_ACE_TYPE) {
+                            trusted.HasUnexpectedAce = true;
+                        }
+                        if (header.AceSize < 8) {
+                            trusted.HasUnexpectedAce = true;
+                            continue;
+                        }
+                        sids[index] = new SecurityIdentifier(new IntPtr(ace.ToInt64() + 8)).Value;
+                    }
+                    trusted.AceSids = sids;
+                }
+            }
+            finally {
+                if (securityDescriptor != IntPtr.Zero) {
+                    LocalFree(securityDescriptor);
+                }
+            }
+
+            if (!trusted.IsReparsePoint && !trusted.IsDirectory && trusted.LinkCountFits && trusted.LinkCount == 1) {
+                System.Collections.Generic.List<byte> content = new System.Collections.Generic.List<byte>();
+                byte[] chunk = new byte[81920];
+                int read;
+                while (true) {
+                    if (!ReadFile(handle, chunk, chunk.Length, out read, IntPtr.Zero)) {
+                        throw new Win32Exception(Marshal.GetLastWin32Error());
+                    }
+                    if (read == 0) {
+                        break;
+                    }
+                    for (int i = 0; i < read; i++) {
+                        content.Add(chunk[i]);
+                    }
+                }
+                trusted.Bytes = content.ToArray();
+            }
+            return trusted;
         }
         finally {
             handle.Dispose();
@@ -5271,7 +5451,7 @@ function Get-EmailFileReplacementPlan {
     )
 
     if (-not $SourceExists) {
-        throw "Cannot replace C:\scripts\Email.py because C:\FSRM\Email.py is missing. The existing script was left unchanged."
+        throw "Cannot replace C:\scripts\Email.py because C:\FSRM\Email.py is missing. The existing script was left unchanged. Restore a trusted Email.py to C:\FSRM\ and run this script again."
     }
 
     if ($DestinationExists) {
@@ -5295,6 +5475,127 @@ function Set-ScriptsDirectorySecurityByHandle {
     [FsrmScriptFileHandle]::ProtectDirectory($Path)
 }
 
+function Assert-TrustedEmailSource {
+    param(
+        [Parameter(Mandatory = $true)]
+        [bool]$Exists,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$IsReparsePoint,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$IsDirectory,
+
+        $LinkCount,
+
+        [string]$OwnerSid,
+
+        [string[]]$AceSids,
+
+        [bool]$HasDenyAce,
+
+        [bool]$HasDacl = $true,
+
+        [bool]$HasUnexpectedAce
+    )
+
+    $rerun = ' No changes were made. Restore a trusted Email.py to C:\FSRM\ and run this script again.'
+    if (-not $Exists) {
+        throw "C:\FSRM\Email.py is missing.$rerun"
+    }
+    if ($IsReparsePoint) {
+        throw "C:\FSRM\Email.py is a reparse point (junction or symlink), not a regular file.$rerun"
+    }
+    if ($IsDirectory) {
+        throw "C:\FSRM\Email.py is a directory, not a regular file.$rerun"
+    }
+    if (($LinkCount -isnot [int]) -or ($LinkCount -ne 1)) {
+        throw "C:\FSRM\Email.py does not have a link count of 1.$rerun"
+    }
+    if ($OwnerSid -ne 'S-1-5-32-544' -and $OwnerSid -ne 'S-1-5-18') {
+        throw "C:\FSRM\Email.py is not owned by Administrators or SYSTEM.$rerun"
+    }
+    if ((-not $HasDacl) -or $HasDenyAce -or $HasUnexpectedAce) {
+        throw "C:\FSRM\Email.py does not grant access only to Administrators and SYSTEM.$rerun"
+    }
+
+    $protectedSids = @('S-1-5-32-544', 'S-1-5-18')
+    $sawProtected = $false
+    foreach ($sid in @($AceSids)) {
+        if ([string]::IsNullOrWhiteSpace($sid) -or ($protectedSids -notcontains $sid)) {
+            throw "C:\FSRM\Email.py does not grant access only to Administrators and SYSTEM.$rerun"
+        }
+        $sawProtected = $true
+    }
+    if (-not $sawProtected) {
+        throw "C:\FSRM\Email.py does not grant access only to Administrators and SYSTEM.$rerun"
+    }
+}
+
+function Invoke-SetupAfterTrustedEmailSource {
+    param(
+        [Parameter(Mandatory = $true)]
+        [bool]$Exists,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$IsReparsePoint,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$IsDirectory,
+
+        $LinkCount,
+
+        [string]$OwnerSid,
+
+        [string[]]$AceSids,
+
+        [bool]$HasDenyAce,
+
+        [bool]$HasDacl = $true,
+
+        [bool]$HasUnexpectedAce,
+
+        [Parameter(Mandatory = $true)]
+        [scriptblock]$Change
+    )
+
+    Assert-TrustedEmailSource -Exists $Exists -IsReparsePoint $IsReparsePoint -IsDirectory $IsDirectory -LinkCount $LinkCount -OwnerSid $OwnerSid -AceSids $AceSids -HasDenyAce $HasDenyAce -HasDacl $HasDacl -HasUnexpectedAce $HasUnexpectedAce
+    & $Change
+}
+
+function Read-TrustedEmailFile {
+    param(
+        [string]$Path = 'C:\FSRM\Email.py'
+    )
+
+    if ($env:OS -ne 'Windows_NT') {
+        throw "Validating C:\FSRM\Email.py requires Windows."
+    }
+
+    Initialize-FileHandleNative
+    $raw = $null
+    try {
+        $raw = [FsrmScriptFileHandle]::ReadTrusted($Path)
+    }
+    catch {
+        $inner = $_.Exception
+        while ($null -ne $inner.InnerException) {
+            $inner = $inner.InnerException
+        }
+        if ($inner -is [System.IO.FileNotFoundException]) {
+            Assert-TrustedEmailSource -Exists $false -IsReparsePoint $false -IsDirectory $false -LinkCount $null -HasDacl $false
+        }
+        throw
+    }
+
+    $linkCount = $null
+    if ($raw.LinkCountFits -and ($raw.LinkCount -is [int])) {
+        $linkCount = $raw.LinkCount
+    }
+    Assert-TrustedEmailSource -Exists $true -IsReparsePoint $raw.IsReparsePoint -IsDirectory $raw.IsDirectory -LinkCount $linkCount -OwnerSid $raw.OwnerSid -AceSids $raw.AceSids -HasDenyAce $raw.HasDenyAce -HasDacl $raw.HasDacl -HasUnexpectedAce $raw.HasUnexpectedAce
+    return $raw.Bytes
+}
+
 function Install-ProtectedEmailScript {
     param(
         [string]$SourcePath = 'C:\FSRM\Email.py',
@@ -5305,15 +5606,13 @@ function Install-ProtectedEmailScript {
         throw "Replacing Email.py requires Windows."
     }
 
-    $sourceFacts = Get-UnfollowedFileFacts -Path $SourcePath
-    $destinationFacts = Get-UnfollowedFileFacts -Path $DestinationPath
-    $plan = Get-EmailFileReplacementPlan -SourceExists ($null -ne $sourceFacts) -DestinationExists ($null -ne $destinationFacts)
-    if ($sourceFacts.IsReparsePoint -or $sourceFacts.IsDirectory) {
-        throw "Refusing to read '$SourcePath' because it is a reparse point or a directory."
+    if ($null -eq $script:trustedEmailBytes) {
+        throw "C:\FSRM\Email.py was not validated. No changes were made. Restore a trusted Email.py to C:\FSRM\ and run this script again."
     }
 
-    # Read the new script before removing the copy FSRM is already running.
-    $bytes = [System.IO.File]::ReadAllBytes($SourcePath)
+    $bytes = $script:trustedEmailBytes
+    $destinationFacts = Get-UnfollowedFileFacts -Path $DestinationPath
+    $plan = Get-EmailFileReplacementPlan -SourceExists $true -DestinationExists ($null -ne $destinationFacts)
     if ($plan -eq 'DeleteThenCreate') {
         $name = [System.IO.Path]::GetFileName($DestinationPath)
         $ownerSid = $null
@@ -5467,6 +5766,9 @@ function New-RestrictedPythonDownloadDirectory {
 
     return $path
 }
+
+# Check the source email script before FSRM, C:\scripts, or any ACL is changed.
+$script:trustedEmailBytes = Read-TrustedEmailFile -Path 'C:\FSRM\Email.py'
 
 Install-FSRMRansomware -SMTPServer $SMTPServer -EmailTo $EmailTo -EmailFrom $EmailFrom
 
