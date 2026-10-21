@@ -4474,7 +4474,7 @@ function Install-FSRMRansomware {
                 try {
                     $existingRansomwareGroup = Get-FsrmFileGroup -Name "Ransomware Files" -ErrorAction Stop
                 } catch {
-                    if ($_.Exception.Message -notmatch '80045301|was not found|cannot find|does not exist') {
+                    if (-not (Test-FsrmObjectIsMissing -Message $_.Exception.Message -ErrorId $_.FullyQualifiedErrorId -Category ([string]$_.CategoryInfo.Category))) {
                         throw
                     }
                 }
@@ -4492,7 +4492,7 @@ function Install-FSRMRansomware {
             try {
                 $existingScreenTemplate = Get-FsrmFileScreenTemplate -Name "RansomwareCheck" -ErrorAction Stop
             } catch {
-                if ($_.Exception.Message -notmatch '80045301|was not found|cannot find|does not exist') {
+                if (-not (Test-FsrmObjectIsMissing -Message $_.Exception.Message -ErrorId $_.FullyQualifiedErrorId -Category ([string]$_.CategoryInfo.Category))) {
                     throw
                 }
             }
@@ -4553,7 +4553,7 @@ function Install-FSRMRansomware {
                                         try {
                                             $existingScreen = Get-FsrmFileScreen -Path $screenPath -ErrorAction Stop
                                         } catch {
-                                            if ($_.Exception.Message -notmatch '80045301|was not found|cannot find|does not exist') {
+                                            if (-not (Test-FsrmObjectIsMissing -Message $_.Exception.Message -ErrorId $_.FullyQualifiedErrorId -Category ([string]$_.CategoryInfo.Category))) {
                                                 throw
                                             }
                                         }
@@ -4570,6 +4570,17 @@ function Install-FSRMRansomware {
 }
 # SMTPServer, EmailTo, and EmailFrom are required parameters.
 # Supply them when running this script. Example addresses are not embedded here.
+
+function Test-FsrmObjectIsMissing {
+    param(
+        [string]$Message,
+        [string]$ErrorId,
+        [string]$Category
+    )
+
+    $text = "$Message $ErrorId $Category"
+    return [bool]($text -match '80045301|NotFound|not found|cannot find|does not exist|ObjectNotFound|objects found')
+}
 
 function Get-FsrmSetupAction {
     param(
