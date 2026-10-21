@@ -122,29 +122,66 @@ if ($ok1 -and $fsrmAvailable -and $screenDisk) {
   $results['6 passive/wrong screen fixed'] = ($code -eq 0 -and $fs.Template -eq 'RansomwareCheck' -and $fs.Active -eq $true -and (@($fs.IncludeGroup) -join ',') -eq 'Ransomware Files')
   if ($results['6 passive/wrong screen fixed']) {
     $plantReady = $false
+    # FSRM action objects are CimInstance values and have no Clone() method.
+    # Edit the screen's own command, then fall back to a new action or filescrn.
     try {
-      $actions = @((Get-FsrmFileScreen -Path $sp).Notification | ForEach-Object { $_.Clone() })
-      if (@($actions | Where-Object { [string]$_.Type -eq 'Command' }).Count -lt 1) {
-        $actions = @((Get-FsrmFileScreenTemplate -Name 'RansomwareCheck').Notification | ForEach-Object { $_.Clone() })
-      }
-      $sawPlantedCommand = $false
+      $actions = @((Get-FsrmFileScreen -Path $sp).Notification)
+      $edited = $false
       foreach ($action in $actions) {
         if ([string]$action.Type -eq 'Command') {
           $action.Command = "$env:SystemRoot\System32\cmd.exe"
           $action.CommandParameters = '/c echo planted'
           $action.WorkingDirectory = "$env:SystemRoot\System32"
-          $sawPlantedCommand = $true
+          $edited = $true
         }
       }
-      Set-FsrmFileScreen -Path $sp -Active -IncludeGroup 'Ransomware Files' -Notification $actions -ErrorAction Stop
+      if ($edited) {
+        Set-FsrmFileScreen -Path $sp -Active -IncludeGroup 'Ransomware Files' -Notification $actions -ErrorAction Stop
+      }
+    } catch {
+      Write-Host "  in-place plant failed: $($_.Exception.Message)"
+    }
+    $prePlant = Get-FsrmFileScreen -Path $sp
+    $preCmds = @($prePlant.Notification | Where-Object { [string]$_.Type -eq 'Command' })
+    $preCommandText = (@($preCmds | ForEach-Object { [string]$_.Command }) -join ';')
+    if ($preCommandText -notlike '*\cmd.exe') {
+      try {
+        $newCmd = New-FsrmAction -Type Command -Command "$env:SystemRoot\System32\cmd.exe" -CommandParameters '/c echo planted' -WorkingDirectory "$env:SystemRoot\System32" -SecurityLevel LocalSystem -KillTimeOut 0 -ErrorAction Stop
+        $notes = @()
+        $replaced = $false
+        foreach ($n in @((Get-FsrmFileScreen -Path $sp).Notification)) {
+          if ((-not $replaced) -and ([string]$n.Type -eq 'Command')) {
+            $notes += $newCmd
+            $replaced = $true
+          } else {
+            $notes += $n
+          }
+        }
+        if (-not $replaced) { $notes += $newCmd }
+        Set-FsrmFileScreen -Path $sp -Active -IncludeGroup 'Ransomware Files' -Notification $notes -ErrorAction Stop
+      } catch {
+        Write-Host "  New-FsrmAction plant failed: $($_.Exception.Message)"
+        $cfg = Join-Path $env:TEMP 'planted-screen-command.txt'
+        @(
+          'Notification=Command'
+          'RunLimitInterval=60'
+          "Command=$env:SystemRoot\System32\cmd.exe"
+          'Arguments=/c echo planted'
+          "WorkingDirectory=$env:SystemRoot\System32"
+          'MonitorCommand=Disable'
+          'Account=LocalSystem'
+          'KillTimeOut=0'
+        ) | Set-Content -LiteralPath $cfg -Encoding ascii
+        & filescrn.exe screen modify "/path:$sp" "/add-notification:$cfg" | Write-Host
+        Write-Host "  filescrn exit $LASTEXITCODE"
+        Remove-Item -LiteralPath $cfg -Force -ErrorAction SilentlyContinue
+      }
       $prePlant = Get-FsrmFileScreen -Path $sp
       $preCmds = @($prePlant.Notification | Where-Object { [string]$_.Type -eq 'Command' })
-      $preCommand = if ($preCmds.Count -ge 1) { [string]$preCmds[0].Command } else { '' }
-      Write-Host "  planted template=$($prePlant.Template) active=$($prePlant.Active) groups=$(@($prePlant.IncludeGroup) -join ',') command=$preCommand"
-      $plantReady = $sawPlantedCommand -and ($prePlant.Template -eq 'RansomwareCheck') -and ($prePlant.Active -eq $true) -and ((@($prePlant.IncludeGroup) -join ',') -eq 'Ransomware Files') -and ($preCmds.Count -eq 1) -and ($preCommand -like '*\cmd.exe')
-    } catch {
-      Write-Host "  could not plant screen command: $($_.Exception.Message)"
+      $preCommandText = (@($preCmds | ForEach-Object { [string]$_.Command }) -join ';')
     }
+    Write-Host "  planted template=$($prePlant.Template) active=$($prePlant.Active) groups=$(@($prePlant.IncludeGroup) -join ',') commands=$preCommandText"
+    $plantReady = ($prePlant.Template -eq 'RansomwareCheck') -and ($prePlant.Active -eq $true) -and ((@($prePlant.IncludeGroup) -join ',') -eq 'Ransomware Files') -and ($preCommandText -like '*\cmd.exe')
     New-Source -Text $src1
     $codePlant = Invoke-Fsrm
     $fsPlant = Get-FsrmFileScreen -Path $sp
