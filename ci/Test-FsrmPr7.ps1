@@ -88,6 +88,73 @@ if ($ok1) {
   if (Test-Path C:\scripts) { foreach ($f in Get-ChildItem -LiteralPath C:\scripts -Force) { [void](Test-AdminOnlyAcl $f.FullName) } }
 } else { $results['4 re-run replaces both files'] = $null; Write-Host "  skipped: check 1 failed" }
 
+Write-Host "=== Check 5: tampered RansomwareCheck template is replaced ==="
+if ($ok1 -and $fsrmAvailable) {
+  $evil = New-FsrmAction -Type Command -Command 'C:\Windows\System32\cmd.exe' -CommandParameters '/c echo tampered' -WorkingDirectory 'C:\Windows' -SecurityLevel LocalSystem
+  Set-FsrmFileScreenTemplate -Name 'RansomwareCheck' -Notification @($evil)
+  New-Source -Text $src1
+  $code = Invoke-Fsrm
+  $t = Get-FsrmFileScreenTemplate -Name 'RansomwareCheck'
+  $cmds = @($t.Notification | Where-Object { [string]$_.Type -eq 'Command' })
+  $cmds | ForEach-Object { Write-Host "  command=$($_.Command) params=$($_.CommandParameters) level=$($_.SecurityLevel)" }
+  $results['5 tampered template replaced'] = ($code -eq 0 -and $cmds.Count -eq 1 -and $cmds[0].Command -like '*WindowsPowerShell\v1.0\powershell.exe' -and $cmds[0].CommandParameters -like '*ScriptToDenyPermissions.PS1*')
+} else { $results['5 tampered template replaced'] = $null; Write-Host "  skipped" }
+
+Write-Host "=== Check 6: passive / wrong-template file screen is fixed ==="
+$screenDisk = @(Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" | Where-Object { $_.DeviceID -ne 'C:' }) | Select-Object -First 1
+if ($ok1 -and $fsrmAvailable -and $screenDisk) {
+  $sp = "$($screenDisk.DeviceID)\"
+  if (-not (Get-FsrmFileScreenTemplate -Name 'CiOtherTemplate' -ErrorAction SilentlyContinue)) {
+    New-FsrmFileScreenTemplate -Name 'CiOtherTemplate' -IncludeGroup @('Ransomware Files') | Out-Null
+  }
+  Set-FsrmFileScreen -Path $sp -Template 'CiOtherTemplate'
+  Set-FsrmFileScreen -Path $sp -Active:$false
+  $pre = Get-FsrmFileScreen -Path $sp; Write-Host "  before template=$($pre.Template) active=$($pre.Active)"
+  New-Source -Text $src1
+  $code = Invoke-Fsrm
+  $fs = Get-FsrmFileScreen -Path $sp; Write-Host "  after template=$($fs.Template) active=$($fs.Active) groups=$(@($fs.IncludeGroup) -join ',')"
+  $results['6 passive/wrong screen fixed'] = ($code -eq 0 -and $fs.Template -eq 'RansomwareCheck' -and $fs.Active -eq $true -and (@($fs.IncludeGroup) -join ',') -eq 'Ransomware Files')
+} else { $results['6 passive/wrong screen fixed'] = $null; Write-Host "  skipped: no non-C fixed disk or earlier failure" }
+
+Write-Host "=== Check 7: pre-existing ExcludePattern is cleared ==="
+if ($ok1 -and $fsrmAvailable) {
+  Set-FsrmFileGroup -Name 'Ransomware Files' -ExcludePattern @('*.locky')
+  New-Source -Text $src1
+  $code = Invoke-Fsrm
+  $g = Get-FsrmFileGroup -Name 'Ransomware Files'
+  Write-Host "  ExcludePattern count=$(@($g.ExcludePattern).Count)"
+  $results['7 ExcludePattern cleared'] = ($code -eq 0 -and @($g.ExcludePattern | Where-Object { $_ }).Count -eq 0)
+} else { $results['7 ExcludePattern cleared'] = $null; Write-Host "  skipped" }
+
+Write-Host "=== Check 8: pre-created C:\Users\Public\FSRMTemplate.xml is not used ==="
+if ($ok1 -and $fsrmAvailable) {
+  $pub = 'C:\Users\Public\FSRMTemplate.xml'
+  $planted = '<?xml version="1.0" ?><Root ><Header DatabaseVersion = ''2.0'' ></Header><QuotaTemplates ></QuotaTemplates><DatascreenTemplates ><DatascreenTemplate Name = ''RansomwareCheck'' Id = ''{122F5AB4-9DF0-4F09-B89E-0F7BDC9D46CC}'' Flags = ''1'' Description = ''planted'' ><BlockedGroups ><FileGroup FileGroupId = ''{82D08F60-7319-4BE2-8621-066DB91A958E}'' Name = ''Ransomware%sFiles'' ></FileGroup></BlockedGroups><FileGroupActions ><Action Type="3" Id="{D0B80CC5-E6DD-481C-9534-19944A851A72}" ExecutablePath="C:\Windows\System32\cmd.exe" Arguments="/c echo planted" WorkingDirectory="C:\Windows\" Account="3" MonitorCommand="0" KillTimeOut="0" LogResult="1" /></FileGroupActions></DatascreenTemplate></DatascreenTemplates><FileGroups ></FileGroups></Root>'
+  Set-Content -LiteralPath $pub -Value $planted -Encoding Unicode
+  $hp = Hash $pub
+  New-Source -Text $src1
+  $code = Invoke-Fsrm
+  $t = Get-FsrmFileScreenTemplate -Name 'RansomwareCheck'
+  $cmds = @($t.Notification | Where-Object { [string]$_.Type -eq 'Command' })
+  $untouched = (Test-Path -LiteralPath $pub) -and ((Hash $pub) -eq $hp)
+  $leftover = @(Get-ChildItem -LiteralPath C:\scripts -Filter 'FSRMTemplate*.xml' -Force -ErrorAction SilentlyContinue).Count
+  Write-Host "  publicUntouched=$untouched leftoverTemplateXml=$leftover command=$($cmds[0].Command)"
+  $results['8 planted Public XML ignored'] = ($code -eq 0 -and $untouched -and $leftover -eq 0 -and $cmds.Count -eq 1 -and $cmds[0].Command -like '*powershell.exe')
+  Remove-Item -LiteralPath $pub -Force -ErrorAction SilentlyContinue
+} else { $results['8 planted Public XML ignored'] = $null; Write-Host "  skipped" }
+
+Write-Host "=== Check 9: failed installer exit code throws ==="
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($script, [ref]$null, [ref]$null)
+foreach ($n in @('Assert-NativeCommandSucceeded','Invoke-PythonInstaller')) {
+  $fn = $ast.Find({ param($a) $a -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq $n }, $true)
+  . ([scriptblock]::Create($fn.Extent.Text))
+}
+$threwOnFail = $false
+try { Invoke-PythonInstaller -FilePath "$env:SystemRoot\System32\cmd.exe" -ArgumentList @('/c','exit 1603') -CommandName 'fake installer' } catch { $threwOnFail = $true; Write-Host "  threw: $($_.Exception.Message)" }
+$okOnZero = $true
+try { Invoke-PythonInstaller -FilePath "$env:SystemRoot\System32\cmd.exe" -ArgumentList @('/c','exit 0') -CommandName 'fake installer' } catch { $okOnZero = $false; Write-Host "  unexpected throw: $($_.Exception.Message)" }
+$results['9 failed installer exit code throws'] = ($threwOnFail -and $okOnZero)
+
 Write-Host "=== Bonus: python tests/test_email.py ==="
 $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + $env:Path
 Push-Location $repo; $env:PYTHONPATH = $repo
