@@ -113,7 +113,7 @@ if ($ok1 -and $fsrmAvailable -and $screenDisk) {
   if (-not (Get-FsrmFileScreenTemplate -Name 'CiOtherTemplate' -ErrorAction SilentlyContinue)) {
     New-FsrmFileScreenTemplate -Name 'CiOtherTemplate' -IncludeGroup @('Ransomware Files') | Out-Null
   }
-  Set-FsrmFileScreen -Path $sp -Template 'CiOtherTemplate'
+  Reset-FsrmFileScreen -Path $sp -Template 'CiOtherTemplate' -Confirm:$false
   Set-FsrmFileScreen -Path $sp -Active:$false
   $pre = Get-FsrmFileScreen -Path $sp; Write-Host "  before template=$($pre.Template) active=$($pre.Active)"
   New-Source -Text $src1

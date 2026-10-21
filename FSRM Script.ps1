@@ -4553,7 +4553,9 @@ function Install-FSRMRansomware {
                                             New-FsrmFileScreen -Path $screenPath -Template "RansomwareCheck" -Active
                                         } elseif (-not (Test-RansomwareFileScreenIsExpected -Screen $existingScreen)) {
                                             # A passive screen or another template would not block or run the deny script.
-                                            Set-FsrmFileScreen -Path $screenPath -Template "RansomwareCheck" -Active -IncludeGroup @("Ransomware Files")
+                                            # Set-FsrmFileScreen has no -Template; Reset-FsrmFileScreen re-applies one.
+                                            Reset-FsrmFileScreen -Path $screenPath -Template "RansomwareCheck" -Confirm:$false
+                                            Set-FsrmFileScreen -Path $screenPath -Active -IncludeGroup @("Ransomware Files")
                                         }
                                         $finalScreen = Get-FsrmFileScreen -Path $screenPath -ErrorAction Stop
                                         if (-not (Test-RansomwareFileScreenIsExpected -Screen $finalScreen)) {
