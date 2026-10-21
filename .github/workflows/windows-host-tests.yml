@@ -1,0 +1,26 @@
+name: windows-host-tests
+on:
+  push:
+    branches: [ 'ci/windows-tests-pr7' ]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [ powershell, pwsh ]
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install FSRM feature
+        shell: powershell
+        run: |
+          $r = Install-WindowsFeature FS-Resource-Manager -IncludeManagementTools
+          $r | Format-List | Out-String | Write-Host
+          Get-WindowsFeature FS-Resource-Manager,RSAT-FSRM-Mgmt | Format-Table | Out-String | Write-Host
+      - name: Run tests under ${{ matrix.shell }}
+        shell: pwsh
+        run: ./ci/Test-FsrmPr7.ps1 -ShellExe ${{ matrix.shell }}
