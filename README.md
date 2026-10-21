@@ -29,6 +29,14 @@ Open a new shell, or refresh PATH in the current one, before using `python`. The
 
 ## Running the script again
 
-Before each run, restore a trusted `Email.py` to `C:\FSRM\Email.py`. The script checks that file before it changes FSRM or `C:\scripts`. The file must be a regular file, not a junction or symlink. Its owner must be Administrators or SYSTEM, its access list must grant access only to Administrators and SYSTEM, and it must have a single link.
+Before each run, restore a trusted `Email.py` to `C:\FSRM\Email.py`. The script checks that file before it changes FSRM or `C:\scripts`. The file must be a regular file, not a junction or symlink. Its owner must be Administrators or SYSTEM, its access list must grant access only to Administrators and SYSTEM, and it must have a single link. An empty file is rejected.
+
+From an elevated command prompt, restrict the file to Administrators and SYSTEM:
+
+```powershell
+icacls C:\FSRM\Email.py /inheritance:r
+icacls C:\FSRM\Email.py /grant *S-1-5-32-544:F *S-1-5-18:F
+icacls C:\FSRM\Email.py /setowner *S-1-5-32-544
+```
 
 A successful run removes `C:\FSRM\Email.py`. If that file is missing or is not trusted, the script stops without changing FSRM or `C:\scripts`. Restore a trusted `Email.py` to `C:\FSRM\` and run the script again.

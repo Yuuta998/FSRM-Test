@@ -5593,7 +5593,16 @@ function Read-TrustedEmailFile {
         $linkCount = $raw.LinkCount
     }
     Assert-TrustedEmailSource -Exists $true -IsReparsePoint $raw.IsReparsePoint -IsDirectory $raw.IsDirectory -LinkCount $linkCount -OwnerSid $raw.OwnerSid -AceSids $raw.AceSids -HasDenyAce $raw.HasDenyAce -HasDacl $raw.HasDacl -HasUnexpectedAce $raw.HasUnexpectedAce
-    return $raw.Bytes
+    Assert-TrustedEmailBytes -Bytes $raw.Bytes
+    return ,$raw.Bytes
+}
+
+function Assert-TrustedEmailBytes {
+    param($Bytes)
+
+    if ($null -eq $Bytes -or $Bytes.Length -eq 0) {
+        throw "C:\FSRM\Email.py is empty. No changes were made. Restore a trusted Email.py to C:\FSRM\ and run this script again."
+    }
 }
 
 function Install-ProtectedEmailScript {
@@ -5602,12 +5611,13 @@ function Install-ProtectedEmailScript {
         [string]$DestinationPath = 'C:\scripts\Email.py'
     )
 
-    if ($env:OS -ne 'Windows_NT') {
-        throw "Replacing Email.py requires Windows."
-    }
-
     if ($null -eq $script:trustedEmailBytes) {
         throw "C:\FSRM\Email.py was not validated. No changes were made. Restore a trusted Email.py to C:\FSRM\ and run this script again."
+    }
+    Assert-TrustedEmailBytes -Bytes $script:trustedEmailBytes
+
+    if ($env:OS -ne 'Windows_NT') {
+        throw "Replacing Email.py requires Windows."
     }
 
     $bytes = $script:trustedEmailBytes
